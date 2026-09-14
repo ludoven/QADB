@@ -1,5 +1,7 @@
 package com.ludoven.adbtool.pages
 
+import androidx.compose.foundation.gestures.detectTapGestures
+
 import adbtool_desktop.composeapp.generated.resources.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -543,6 +545,8 @@ fun AppScreen(
     val tabCountMap = remember(appList) {
         appFilterCounts(appList)
     }
+    val isInstalling by viewModel.isInstalling.collectAsState()
+    val installProgress by viewModel.currentInstallingProgress.collectAsState()
 
     Scaffold(containerColor = Color.Transparent) { paddingValues ->
         if (appInfo != null) {
@@ -636,6 +640,35 @@ fun AppScreen(
                             onModeChange = { viewModel.setGridView(it) }
                         )
                     }
+
+                    OutlinedButton(
+                        onClick = {
+                            viewModel.batchInstallFromFolder(selectedDevice)
+                        },
+                        enabled = hasSelectedDevice && !isInstalling,
+                        shape = RoundedCornerShape(UiTokens.RadiusMedium),
+                        border = BorderStroke(1.dp, AppVisualTokens.BorderStrong),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = AppVisualTokens.Surface,
+                            contentColor = AppVisualTokens.Text,
+                            disabledContentColor = AppVisualTokens.Muted.copy(alpha = 0.45f)
+                        ),
+                        contentPadding = PaddingValues(horizontal = UiTokens.SpaceMedium, vertical = 0.dp),
+                        modifier = Modifier.height(36.dp)
+                    ) {
+                        Icon(Icons.Default.Upload, contentDescription = null, modifier = Modifier.size(UiTokens.IconSmall))
+                        Spacer(Modifier.width(UiTokens.SpaceSmall))
+                        Text(
+                            text = if (isInstalling) {
+                                val progress = installProgress?.let { " ($it)" } ?: ""
+                                l10n("安装中", "Installing") + progress
+                            } else {
+                                l10n("批量安装应用", "Batch install")
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
                 }
             }
 
@@ -713,7 +746,8 @@ fun AppScreen(
                                             pendingDangerAction = type to app
                                             confirmActionLabel = label
                                             confirmActionMessage = message
-                                        }
+                                        },
+                                        onOpen = { viewModel.openAppInfo(app.packageName) }
                                     )
                                 }
                             }
@@ -753,7 +787,8 @@ fun AppScreen(
                                                 pendingDangerAction = type to app
                                                 confirmActionLabel = label
                                                 confirmActionMessage = message
-                                            }
+                                            },
+                                            onOpen = { viewModel.openAppInfo(app.packageName) }
                                         )
                                         HorizontalDivider(color = AppVisualTokens.Divider.copy(alpha = 0.35f))
                                     }
@@ -943,7 +978,8 @@ private fun AppListRow(
     icon: ImageBitmap?,
     onAction: (AdbFunctionType) -> Unit,
     onCopyPackageName: () -> Unit,
-    onRequestDangerAction: (AdbFunctionType, String, String) -> Unit
+    onRequestDangerAction: (AdbFunctionType, String, String) -> Unit,
+    onOpen: () -> Unit
 ) {
     val rowInteraction = remember { MutableInteractionSource() }
     val isRowHovered by rowInteraction.collectIsHoveredAsState()
@@ -959,6 +995,7 @@ private fun AppListRow(
             .hoverable(rowInteraction)
             .clip(shape)
             .background(if (isRowHovered) AppVisualTokens.Soft.copy(alpha = 0.55f) else Color.Transparent)
+            .pointerInput(app.packageName) { detectTapGestures(onDoubleTap = { onOpen() }) }
             .pointerInput(app.packageName) {
                 awaitPointerEventScope {
                     while (true) {
@@ -1262,7 +1299,8 @@ private fun AppGridCard(
     icon: ImageBitmap?,
     onAction: (AdbFunctionType) -> Unit,
     onCopyPackageName: () -> Unit,
-    onRequestDangerAction: (AdbFunctionType, String, String) -> Unit
+    onRequestDangerAction: (AdbFunctionType, String, String) -> Unit,
+    onOpen: () -> Unit
 ) {
     val interactionSource = remember { MutableInteractionSource() }
     val isHovered by interactionSource.collectIsHoveredAsState()
@@ -1282,6 +1320,7 @@ private fun AppGridCard(
                 if (isHovered) AppVisualTokens.Primary.copy(alpha = 0.45f) else AppVisualTokens.Border,
                 shape
             )
+            .pointerInput(app.packageName) { detectTapGestures(onDoubleTap = { onOpen() }) }
             .pointerInput(app.packageName) {
                 awaitPointerEventScope {
                     while (true) {

@@ -19,6 +19,7 @@ import com.ludoven.adbtool.widget.FramedStateSurface
 import com.ludoven.adbtool.widget.DeviceRequiredState
 import com.ludoven.adbtool.widget.PageHeader
 import androidx.compose.foundation.*
+import androidx.compose.foundation.draganddrop.dragAndDropTarget
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsHoveredAsState
 import androidx.compose.foundation.layout.*
@@ -34,6 +35,9 @@ import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.ExperimentalComposeUiApi
+import androidx.compose.ui.draganddrop.DragAndDropEvent
+import androidx.compose.ui.draganddrop.DragAndDropTarget
+import androidx.compose.ui.draganddrop.awtTransferable
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.PointerButton
 import androidx.compose.ui.input.pointer.PointerEventType
@@ -52,6 +56,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import java.awt.datatransfer.DataFlavor
+import java.io.File
 import kotlin.math.max
 import org.jetbrains.compose.resources.stringResource
 
@@ -61,6 +67,7 @@ internal fun fileBrowserDeviceActionsEnabled(selectedDevice: String?): Boolean =
 internal fun fileBrowserAvailableSpaceCommand(path: String): String =
     AdbTool.buildShellCommand("df", "-h", path)
 
+@OptIn(ExperimentalComposeUiApi::class, ExperimentalFoundationApi::class)
 @Composable
 fun FileBrowserScreen(
     viewModel: FileBrowserViewModel,
@@ -113,6 +120,29 @@ fun FileBrowserScreen(
     var showAdvancedFields by remember { mutableStateOf(false) }
     var selectedPaths by remember { mutableStateOf(setOf<String>()) }
     var toolbarMenuExpanded by remember { mutableStateOf(false) }
+
+    // Drag-and-drop (upload local files)
+    var isDragActive by remember { mutableStateOf(false) }
+    val dragTarget = remember(selectedDevice) {
+        object : DragAndDropTarget {
+            override fun onStarted(event: DragAndDropEvent) { isDragActive = true }
+            override fun onEntered(event: DragAndDropEvent) { isDragActive = true }
+            override fun onExited(event: DragAndDropEvent) { isDragActive = false }
+            override fun onEnded(event: DragAndDropEvent) { isDragActive = false }
+            override fun onDrop(event: DragAndDropEvent): Boolean {
+                isDragActive = false
+                val transferable = event.awtTransferable
+                if (!transferable.isDataFlavorSupported(DataFlavor.javaFileListFlavor)) return false
+                val fileList = runCatching {
+                    transferable.getTransferData(DataFlavor.javaFileListFlavor)
+                }.getOrNull()
+                val paths = (fileList as? List<*>)?.mapNotNull { (it as? File)?.absolutePath } ?: emptyList()
+                if (paths.isEmpty()) return false
+                viewModel.pushFiles(paths, selectedDevice)
+                return true
+            }
+        }
+    }
 
     val availableSpace by produceState(initialValue = "--", currentPath, selectedDevice) {
         value = "--"
@@ -509,92 +539,63 @@ fun FileBrowserScreen(
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
+                .dragAndDropTarget(shouldStartDragAndDrop = { !selectedDevice.isNullOrBlank() && it.awtTransferable.isDataFlavorSupported(DataFlavor.javaFileListFlavor) }, target = dragTarget)
         ) {
-            when {
-                isLoading -> {
-                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        CircularProgressIndicator()
+            Box(Modifier.fillMaxSize()) {
+                when {
+                    isLoading -> {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator()
+                        }
                     }
-                }
-                errorText != null -> {
-                    FileEmptyState(
-                        kind = FileEmptyKind.EmptyFolder,
-                        title = l10n("目录读取失败", "Failed to load folder"),
-                        description = errorText.orEmpty(),
-                        actionLabel = l10n("重试", "Retry"),
-                        onAction = { viewModel.loadFiles(deviceId = selectedDevice, forceRefresh = true) },
-                        modifier = Modifier.fillMaxSize()
-                    )
-                }
-                filteredFiles.isEmpty() -> {
-                    if (searchKeyword.isNotBlank()) {
-                        FileEmptyState(
-                            kind = FileEmptyKind.NoMatchingFiles,
-                            title = l10n("没有匹配文件", "No matching files"),
-                            description = l10n("调整搜索词或清除筛选后再试。", "Adjust the search term or clear the filter."),
-                            modifier = Modifier.fillMaxSize()
-                        )
-                    } else {
+                    errorText != null -> {
                         FileEmptyState(
                             kind = FileEmptyKind.EmptyFolder,
-                            title = l10n("此目录为空", "This folder is empty"),
-                            description = l10n("当前路径没有可显示的文件或文件夹。", "This path has no visible files or folders."),
+                            title = l10n("目录读取失败", "Failed to load folder"),
+                            description = errorText.orEmpty(),
+                            actionLabel = l10n("重试", "Retry"),
+                            onAction = { viewModel.loadFiles(deviceId = selectedDevice, forceRefresh = true) },
                             modifier = Modifier.fillMaxSize()
                         )
                     }
-                }
-                else -> {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .onGloballyPositioned { coordinates ->
-                                fileListRootPx = coordinates.positionInRoot()
-                            }
-                    ) {
-                        Column(modifier = Modifier.fillMaxSize()) {
-                            // Header row
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.42f))
-                                    .padding(horizontal = UiTokens.SpaceMedium, vertical = 6.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Spacer(modifier = Modifier.width(UiTokens.IndicatorWidth + UiTokens.SpaceSmall))
-                                Text(
-                                    text = l10n("名称", "Name").uppercase(),
-                                    modifier = Modifier.weight(1f),
-                                    style = MaterialTheme.typography.labelSmall.copy(
-                                        fontSize = 10.sp,
-                                        letterSpacing = 0.6.sp
-                                    ),
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    text = l10n("大小", "Size").uppercase(),
-                                    modifier = Modifier.width(80.dp),
-                                    style = MaterialTheme.typography.labelSmall.copy(
-                                        fontSize = 10.sp,
-                                        letterSpacing = 0.6.sp
-                                    ),
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
-                                    fontWeight = FontWeight.Bold
-                                )
-                                Text(
-                                    text = l10n("修改日期", "Modified").uppercase(),
-                                    modifier = Modifier.width(130.dp),
-                                    style = MaterialTheme.typography.labelSmall.copy(
-                                        fontSize = 10.sp,
-                                        letterSpacing = 0.6.sp
-                                    ),
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
-                                    fontWeight = FontWeight.Bold
-                                )
-                                if (showAdvancedFields) {
+                    filteredFiles.isEmpty() -> {
+                        if (searchKeyword.isNotBlank()) {
+                            FileEmptyState(
+                                kind = FileEmptyKind.NoMatchingFiles,
+                                title = l10n("没有匹配文件", "No matching files"),
+                                description = l10n("调整搜索词或清除筛选后再试。", "Adjust the search term or clear the filter."),
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        } else {
+                            FileEmptyState(
+                                kind = FileEmptyKind.EmptyFolder,
+                                title = l10n("此目录为空", "This folder is empty"),
+                                description = l10n("当前路径没有可显示的文件或文件夹。", "This path has no visible files or folders."),
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+                    }
+                    else -> {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .onGloballyPositioned { coordinates ->
+                                    fileListRootPx = coordinates.positionInRoot()
+                                }
+                        ) {
+                            Column(modifier = Modifier.fillMaxSize()) {
+                                // Header row
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.42f))
+                                        .padding(horizontal = UiTokens.SpaceMedium, vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Spacer(modifier = Modifier.width(UiTokens.IndicatorWidth + UiTokens.SpaceSmall))
                                     Text(
-                                        text = l10n("权限", "Permission").uppercase(),
-                                        modifier = Modifier.width(110.dp),
+                                        text = l10n("名称", "Name").uppercase(),
+                                        modifier = Modifier.weight(1f),
                                         style = MaterialTheme.typography.labelSmall.copy(
                                             fontSize = 10.sp,
                                             letterSpacing = 0.6.sp
@@ -603,7 +604,7 @@ fun FileBrowserScreen(
                                         fontWeight = FontWeight.Bold
                                     )
                                     Text(
-                                        text = l10n("所有者", "Owner").uppercase(),
+                                        text = l10n("大小", "Size").uppercase(),
                                         modifier = Modifier.width(80.dp),
                                         style = MaterialTheme.typography.labelSmall.copy(
                                             fontSize = 10.sp,
@@ -612,10 +613,9 @@ fun FileBrowserScreen(
                                         color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
                                         fontWeight = FontWeight.Bold
                                     )
-                                } else {
                                     Text(
-                                        text = l10n("类型", "Type").uppercase(),
-                                        modifier = Modifier.width(90.dp),
+                                        text = l10n("修改日期", "Modified").uppercase(),
+                                        modifier = Modifier.width(130.dp),
                                         style = MaterialTheme.typography.labelSmall.copy(
                                             fontSize = 10.sp,
                                             letterSpacing = 0.6.sp
@@ -623,178 +623,231 @@ fun FileBrowserScreen(
                                         color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
                                         fontWeight = FontWeight.Bold
                                     )
+                                    if (showAdvancedFields) {
+                                        Text(
+                                            text = l10n("权限", "Permission").uppercase(),
+                                            modifier = Modifier.width(110.dp),
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                fontSize = 10.sp,
+                                                letterSpacing = 0.6.sp
+                                            ),
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        Text(
+                                            text = l10n("所有者", "Owner").uppercase(),
+                                            modifier = Modifier.width(80.dp),
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                fontSize = 10.sp,
+                                                letterSpacing = 0.6.sp
+                                            ),
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    } else {
+                                        Text(
+                                            text = l10n("类型", "Type").uppercase(),
+                                            modifier = Modifier.width(90.dp),
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                fontSize = 10.sp,
+                                                letterSpacing = 0.6.sp
+                                            ),
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                }
+
+                                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.60f))
+
+                                // File rows
+                                Box(modifier = Modifier.weight(1f)) {
+                                    LazyColumn(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .padding(end = UiTokens.SpaceSmall),
+                                        state = listState
+                                    ) {
+                                        items(filteredFiles, key = { it.name }) { file ->
+                                            FileRow(
+                                                file = file,
+                                                isHighlighted = selectedPaths.contains("$currentPath/${file.name}") || clipboardFiles.contains("$currentPath/${file.name}"),
+                                                showAdvancedFields = showAdvancedFields,
+                                                onClick = {
+                                                    val full = "$currentPath/${file.name}"
+                                                    selectedPaths = if (selectedPaths.contains(full)) selectedPaths - full else selectedPaths + full
+                                                },
+                                                onOpen = {
+                                                    if (file.isDirectory) {
+                                                        viewModel.navigateTo("$currentPath/${file.name}", selectedDevice)
+                                                    } else {
+                                                        viewModel.openFile("$currentPath/${file.name}", selectedDevice)
+                                                    }
+                                                },
+                                                onRightClick = { clickInRoot ->
+                                                    contextMenuTarget = file
+                                                    val clickInList = clickInRoot - fileListRootPx
+                                                    contextMenuOffsetPx = Offset(
+                                                        x = max(0f, clickInList.x),
+                                                        y = max(0f, clickInList.y)
+                                                    )
+                                                    contextMenuExpanded = true
+                                                }
+                                            )
+                                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.30f))
+                                        }
+                                    }
+
+                                    VerticalScrollbar(
+                                        adapter = rememberScrollbarAdapter(listState),
+                                        modifier = Modifier
+                                            .align(Alignment.CenterEnd)
+                                            .fillMaxHeight()
+                                            .padding(end = UiTokens.SpaceXSmall)
+                                            .padding(vertical = UiTokens.SpaceSmall)
+                                    )
                                 }
                             }
 
-                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.60f))
-
-                            // File rows
-                            Box(modifier = Modifier.weight(1f)) {
-                                LazyColumn(
+                            // Context menu
+                            if (contextMenuExpanded && contextMenuTarget != null) {
+                                Box(
                                     modifier = Modifier
                                         .fillMaxSize()
-                                        .padding(end = UiTokens.SpaceSmall),
-                                    state = listState
-                                ) {
-                                    items(filteredFiles, key = { it.name }) { file ->
-                                        FileRow(
-                                            file = file,
-                                            isHighlighted = selectedPaths.contains("$currentPath/${file.name}") || clipboardFiles.contains("$currentPath/${file.name}"),
-                                            showAdvancedFields = showAdvancedFields,
-                                            onClick = {
-                                                val full = "$currentPath/${file.name}"
-                                                selectedPaths = if (selectedPaths.contains(full)) selectedPaths - full else selectedPaths + full
-                                            },
-                                            onOpen = {
-                                                if (file.isDirectory) {
-                                                    viewModel.navigateTo("$currentPath/${file.name}", selectedDevice)
-                                                } else {
-                                                    viewModel.openFile("$currentPath/${file.name}", selectedDevice)
-                                                }
-                                            },
-                                            onRightClick = { clickInRoot ->
-                                                contextMenuTarget = file
-                                                val clickInList = clickInRoot - fileListRootPx
-                                                contextMenuOffsetPx = Offset(
-                                                    x = max(0f, clickInList.x),
-                                                    y = max(0f, clickInList.y)
-                                                )
-                                                contextMenuExpanded = true
-                                            }
-                                        )
-                                        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.30f))
-                                    }
-                                }
-
-                                VerticalScrollbar(
-                                    adapter = rememberScrollbarAdapter(listState),
-                                    modifier = Modifier
-                                        .align(Alignment.CenterEnd)
-                                        .fillMaxHeight()
-                                        .padding(end = UiTokens.SpaceXSmall)
-                                        .padding(vertical = UiTokens.SpaceSmall)
+                                        .clickable(
+                                            indication = null,
+                                            interactionSource = remember { MutableInteractionSource() }
+                                        ) { contextMenuExpanded = false }
                                 )
+                                androidx.compose.material.DropdownMenu(
+                                    expanded = contextMenuExpanded,
+                                    onDismissRequest = { contextMenuExpanded = false },
+                                    offset = with(density) {
+                                        DpOffset(contextMenuOffsetPx.x.toDp(), contextMenuOffsetPx.y.toDp())
+                                    },
+                                    modifier = Modifier.width(200.dp)
+                                ) {
+                                    val file = contextMenuTarget!!
+                                    val fullPath = "$currentPath/${file.name}"
+
+                                    if (file.isDirectory) {
+                                        DropdownMenuItem(
+                                            text = { Text(l10n("打开", "Open")) },
+                                            onClick = {
+                                                viewModel.navigateTo(fullPath, selectedDevice)
+                                                contextMenuExpanded = false
+                                            },
+                                            leadingIcon = { Icon(IconParkIcons.Folder, l10n("打开", "Open"), modifier = Modifier.size(UiTokens.IconMedium)) }
+                                        )
+                                    } else {
+                                        DropdownMenuItem(
+                                            text = { Text(l10n("打开", "Open")) },
+                                            onClick = {
+                                                viewModel.openFile(fullPath, selectedDevice)
+                                                contextMenuExpanded = false
+                                            },
+                                            leadingIcon = { Icon(Icons.AutoMirrored.Filled.OpenInNew, l10n("打开", "Open"), modifier = Modifier.size(UiTokens.IconMedium)) }
+                                        )
+                                    }
+
+                                    HorizontalDivider(modifier = Modifier.padding(vertical = UiTokens.SpaceXSmall))
+
+                                    DropdownMenuItem(
+                                        text = { Text(l10n("复制路径", "Copy path")) },
+                                        onClick = {
+                                            val copied = copyToClipboardText(fullPath)
+                                            viewModel.showToast(
+                                                MsgContent.Text(if (copied) l10n("已复制路径", "Path copied") else l10n("复制失败", "Copy failed"))
+                                            )
+                                            contextMenuExpanded = false
+                                        },
+                                        leadingIcon = { Icon(Icons.Default.ContentCopy, l10n("复制路径", "Copy path"), modifier = Modifier.size(UiTokens.IconMedium)) }
+                                    )
+
+                                    HorizontalDivider(modifier = Modifier.padding(vertical = UiTokens.SpaceXSmall))
+
+                                    if (!file.isDirectory) {
+                                        DropdownMenuItem(
+                                            text = { Text(l10n("拉取到本地", "Pull to local")) },
+                                            onClick = {
+                                                viewModel.pullFile(fullPath, selectedDevice)
+                                                contextMenuExpanded = false
+                                            },
+                                            leadingIcon = { Icon(IconParkIcons.Download, l10n("拉取", "Pull"), modifier = Modifier.size(UiTokens.IconMedium)) }
+                                        )
+                                    }
+
+                                    DropdownMenuItem(
+                                        text = { Text(l10n("重命名", "Rename")) },
+                                        onClick = {
+                                            renameTarget = file
+                                            renameText = file.name
+                                            showRenameDialog = true
+                                            contextMenuExpanded = false
+                                        },
+                                        leadingIcon = { Icon(Icons.Default.Edit, l10n("重命名", "Rename"), modifier = Modifier.size(UiTokens.IconMedium)) }
+                                    )
+
+                                    HorizontalDivider(modifier = Modifier.padding(vertical = UiTokens.SpaceXSmall))
+
+                                    DropdownMenuItem(
+                                        text = { Text(l10n("查看权限", "View permission")) },
+                                        onClick = {
+                                            viewModel.getFilePermission(fullPath, selectedDevice)
+                                            contextMenuExpanded = false
+                                        },
+                                        leadingIcon = { Icon(Icons.Default.Security, l10n("权限", "Permission"), modifier = Modifier.size(UiTokens.IconMedium)) }
+                                    )
+
+                                    DropdownMenuItem(
+                                        text = { Text(l10n("属性", "Properties")) },
+                                        onClick = {
+                                            viewModel.getFilePermission(fullPath, selectedDevice)
+                                            contextMenuExpanded = false
+                                        },
+                                        leadingIcon = { Icon(IconParkIcons.Info, l10n("属性", "Properties"), modifier = Modifier.size(UiTokens.IconMedium)) }
+                                    )
+
+                                    HorizontalDivider(modifier = Modifier.padding(vertical = UiTokens.SpaceXSmall))
+
+                                    DropdownMenuItem(
+                                        text = { Text(l10n("删除", "Delete"), color = MaterialTheme.colorScheme.error) },
+                                        onClick = {
+                                            deleteTargets = listOf("${currentPath}/${file.name}")
+                                            showDeleteConfirm = true
+                                            contextMenuExpanded = false
+                                        },
+                                        leadingIcon = {
+                                            Icon(
+                                                Icons.Default.Delete,
+                                                l10n("删除", "Delete"),
+                                                modifier = Modifier.size(UiTokens.IconMedium),
+                                                tint = MaterialTheme.colorScheme.error
+                                            )
+                                        }
+                                    )
+                                }
                             }
                         }
-
-                        // Context menu
-                        if (contextMenuExpanded && contextMenuTarget != null) {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .clickable(
-                                        indication = null,
-                                        interactionSource = remember { MutableInteractionSource() }
-                                    ) { contextMenuExpanded = false }
+                    }
+                }
+                if (isDragActive) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f))
+                            .padding(UiTokens.SpaceLarge),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(UiTokens.SpaceSmall)
+                        ) {
+                            Icon(Icons.Default.Upload, null, modifier = Modifier.size(UiTokens.IconLarge))
+                            Text(
+                                text = l10n("松开鼠标以上传到", "Release to upload into") + " $currentPath",
+                                style = MaterialTheme.typography.titleSmall
                             )
-                            androidx.compose.material.DropdownMenu(
-                                expanded = contextMenuExpanded,
-                                onDismissRequest = { contextMenuExpanded = false },
-                                offset = with(density) {
-                                    DpOffset(contextMenuOffsetPx.x.toDp(), contextMenuOffsetPx.y.toDp())
-                                },
-                                modifier = Modifier.width(200.dp)
-                            ) {
-                                val file = contextMenuTarget!!
-                                val fullPath = "$currentPath/${file.name}"
-
-                                if (file.isDirectory) {
-                                    DropdownMenuItem(
-                                        text = { Text(l10n("打开", "Open")) },
-                                        onClick = {
-                                            viewModel.navigateTo(fullPath, selectedDevice)
-                                            contextMenuExpanded = false
-                                        },
-                                        leadingIcon = { Icon(IconParkIcons.Folder, l10n("打开", "Open"), modifier = Modifier.size(UiTokens.IconMedium)) }
-                                    )
-                                } else {
-                                    DropdownMenuItem(
-                                        text = { Text(l10n("打开", "Open")) },
-                                        onClick = {
-                                            viewModel.openFile(fullPath, selectedDevice)
-                                            contextMenuExpanded = false
-                                        },
-                                        leadingIcon = { Icon(Icons.AutoMirrored.Filled.OpenInNew, l10n("打开", "Open"), modifier = Modifier.size(UiTokens.IconMedium)) }
-                                    )
-                                }
-
-                                HorizontalDivider(modifier = Modifier.padding(vertical = UiTokens.SpaceXSmall))
-
-                                DropdownMenuItem(
-                                    text = { Text(l10n("复制路径", "Copy path")) },
-                                    onClick = {
-                                        val copied = copyToClipboardText(fullPath)
-                                        viewModel.showToast(
-                                            MsgContent.Text(if (copied) l10n("已复制路径", "Path copied") else l10n("复制失败", "Copy failed"))
-                                        )
-                                        contextMenuExpanded = false
-                                    },
-                                    leadingIcon = { Icon(Icons.Default.ContentCopy, l10n("复制路径", "Copy path"), modifier = Modifier.size(UiTokens.IconMedium)) }
-                                )
-
-                                HorizontalDivider(modifier = Modifier.padding(vertical = UiTokens.SpaceXSmall))
-
-                                if (!file.isDirectory) {
-                                    DropdownMenuItem(
-                                        text = { Text(l10n("拉取到本地", "Pull to local")) },
-                                        onClick = {
-                                            viewModel.pullFile(fullPath, selectedDevice)
-                                            contextMenuExpanded = false
-                                        },
-                                        leadingIcon = { Icon(IconParkIcons.Download, l10n("拉取", "Pull"), modifier = Modifier.size(UiTokens.IconMedium)) }
-                                    )
-                                }
-
-                                DropdownMenuItem(
-                                    text = { Text(l10n("重命名", "Rename")) },
-                                    onClick = {
-                                        renameTarget = file
-                                        renameText = file.name
-                                        showRenameDialog = true
-                                        contextMenuExpanded = false
-                                    },
-                                    leadingIcon = { Icon(Icons.Default.Edit, l10n("重命名", "Rename"), modifier = Modifier.size(UiTokens.IconMedium)) }
-                                )
-
-                                HorizontalDivider(modifier = Modifier.padding(vertical = UiTokens.SpaceXSmall))
-
-                                DropdownMenuItem(
-                                    text = { Text(l10n("查看权限", "View permission")) },
-                                    onClick = {
-                                        viewModel.getFilePermission(fullPath, selectedDevice)
-                                        contextMenuExpanded = false
-                                    },
-                                    leadingIcon = { Icon(Icons.Default.Security, l10n("权限", "Permission"), modifier = Modifier.size(UiTokens.IconMedium)) }
-                                )
-
-                                DropdownMenuItem(
-                                    text = { Text(l10n("属性", "Properties")) },
-                                    onClick = {
-                                        viewModel.getFilePermission(fullPath, selectedDevice)
-                                        contextMenuExpanded = false
-                                    },
-                                    leadingIcon = { Icon(IconParkIcons.Info, l10n("属性", "Properties"), modifier = Modifier.size(UiTokens.IconMedium)) }
-                                )
-
-                                HorizontalDivider(modifier = Modifier.padding(vertical = UiTokens.SpaceXSmall))
-
-                                DropdownMenuItem(
-                                    text = { Text(l10n("删除", "Delete"), color = MaterialTheme.colorScheme.error) },
-                                    onClick = {
-                                        deleteTargets = listOf("${currentPath}/${file.name}")
-                                        showDeleteConfirm = true
-                                        contextMenuExpanded = false
-                                    },
-                                    leadingIcon = {
-                                        Icon(
-                                            Icons.Default.Delete,
-                                            l10n("删除", "Delete"),
-                                            modifier = Modifier.size(UiTokens.IconMedium),
-                                            tint = MaterialTheme.colorScheme.error
-                                        )
-                                    }
-                                )
-                            }
                         }
                     }
                 }

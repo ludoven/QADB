@@ -850,7 +850,7 @@ private fun loadCommandLibraryFromConfig(): List<CommandItemUi> {
         ?: ClassLoader.getSystemResourceAsStream(fileName)
         ?: return emptyList()
 
-    val jsonText = InputStreamReader(stream).use { it.readText() }
+    val jsonText = InputStreamReader(stream, Charsets.UTF_8).use { it.readText() }
     val root = runCatching { Json.parseToJsonElement(jsonText).jsonArray }.getOrElse { return emptyList() }
 
     return root.mapNotNull { entry ->

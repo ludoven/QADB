@@ -60,13 +60,13 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.rememberScrollbarAdapter
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.VerticalScrollbar
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesomeMotion
@@ -85,14 +85,22 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.input.pointer.PointerButton
+import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.TooltipArea
@@ -131,6 +139,8 @@ import com.ludoven.adbtool.widget.InlineStatusTone
 import org.jetbrains.compose.resources.stringResource
 import java.awt.FileDialog
 import java.awt.Frame
+import java.awt.Toolkit
+import java.awt.datatransfer.StringSelection
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -148,6 +158,32 @@ private enum class QuickKeywordChip {
 internal fun logCaptureActionsEnabled(selectedDevice: String?): Boolean =
     !selectedDevice.isNullOrBlank()
 
+// 由日志行的 y 坐标换算其在 LazyColumn 中的 index
+internal fun logIndexAtY(y: Float, listState: LazyListState): Int {
+    for (item in listState.layoutInfo.visibleItemsInfo) {
+        if (y >= item.offset && y < item.offset + item.size) return item.index
+    }
+    return -1
+}
+
+internal fun snapshotLogSelection(logs: List<LogEntry>, anchor: Int, end: Int): List<LogEntry> =
+    logs.slice(minOf(anchor, end)..maxOf(anchor, end))
+
+private fun formatLogLine(entry: LogEntry, dateFormat: SimpleDateFormat): String {
+    val time = dateFormat.format(Date(entry.timestamp))
+    val tag = if (entry.tag.isBlank()) "-" else entry.tag
+    val pid = if (entry.pid > 0) entry.pid.toString() else "-"
+    val tid = if (entry.tid > 0) entry.tid.toString() else "-"
+    return "$time ${entry.level.displayName}/$tag($pid/$tid): ${entry.message}"
+}
+
+private fun copyTextToClipboard(text: String): Boolean = runCatching {
+    val clipboard = Toolkit.getDefaultToolkit().systemClipboard
+    clipboard.setContents(StringSelection(text), null)
+    true
+}.getOrDefault(false)
+
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class, ExperimentalComposeUiApi::class)
 @Composable
 fun LogScreen(
     viewModel: LogViewModel,
@@ -169,13 +205,20 @@ fun LogScreen(
     var autoScroll by remember { mutableStateOf(true) }
     var userPinnedToBottom by remember { mutableStateOf(true) }
     var selectedQuickChip by remember { mutableStateOf<QuickKeywordChip?>(null) }
-    var selectedLogKey by remember { mutableStateOf<String?>(null) }
+    var selectedLogs by remember { mutableStateOf<List<LogEntry>>(emptyList()) }
+    var logMenuExpanded by remember { mutableStateOf(false) }
+    var clipboardCopyFailed by remember { mutableStateOf(false) }
+    var logMenuOffsetPx by remember { mutableStateOf(Offset.Zero) }
+    var logMenuRootPx by remember { mutableStateOf(Offset.Zero) }
+    val density = LocalDensity.current
 
     val filteredLogs by viewModel.filteredLogs.collectAsState()
     val likelyCurrentPackage by viewModel.likelyCurrentPackage.collectAsState()
     val captureDevice = selectedDevice?.takeIf { logCaptureActionsEnabled(it) }
 
     LaunchedEffect(selectedDevice) {
+        selectedLogs = emptyList()
+        logMenuExpanded = false
         viewModel.setSelectedDevice(selectedDevice)
     }
 
@@ -439,52 +482,77 @@ fun LogScreen(
                     active = selectedQuickChip == QuickKeywordChip.CURRENT_APP,
                     enabled = likelyCurrentPackage != null,
                     onClick = {
-                        selectedQuickChip = QuickKeywordChip.CURRENT_APP
-                        viewModel.updateFilter(filter.copy(packageName = likelyCurrentPackage ?: ""))
+                        if (selectedQuickChip == QuickKeywordChip.CURRENT_APP) {
+                            selectedQuickChip = null
+                            viewModel.updateFilter(filter.copy(packageName = ""))
+                        } else {
+                            selectedQuickChip = QuickKeywordChip.CURRENT_APP
+                            viewModel.updateFilter(filter.copy(packageName = likelyCurrentPackage ?: ""))
+                        }
                     }
                 )
                 QuickFilterChip(
                     text = stringResource(Res.string.log_filter_error),
                     active = selectedQuickChip == QuickKeywordChip.ERROR,
                     onClick = {
-                        selectedQuickChip = QuickKeywordChip.ERROR
-                        viewModel.updateFilter(filter.copy(level = null, onlyErrors = true))
+                        if (selectedQuickChip == QuickKeywordChip.ERROR) {
+                            selectedQuickChip = null
+                            viewModel.updateFilter(filter.copy(onlyErrors = false))
+                        } else {
+                            selectedQuickChip = QuickKeywordChip.ERROR
+                            viewModel.updateFilter(filter.copy(level = null, onlyErrors = true))
+                        }
                     }
                 )
                 QuickFilterChip(
                     text = stringResource(Res.string.log_keyword_chip_warning),
                     active = selectedQuickChip == QuickKeywordChip.WARNING,
                     onClick = {
-                        selectedQuickChip = QuickKeywordChip.WARNING
-                        viewModel.updateFilter(filter.copy(level = LogLevel.WARN, onlyErrors = false))
+                        if (selectedQuickChip == QuickKeywordChip.WARNING) {
+                            selectedQuickChip = null
+                            viewModel.updateFilter(filter.copy(level = null))
+                        } else {
+                            selectedQuickChip = QuickKeywordChip.WARNING
+                            viewModel.updateFilter(filter.copy(level = LogLevel.WARN, onlyErrors = false))
+                        }
                     }
                 )
                 QuickFilterChip(
                     text = stringResource(Res.string.log_keyword_chip_crash),
                     active = selectedQuickChip == QuickKeywordChip.CRASH,
                     onClick = {
-                        selectedQuickChip = QuickKeywordChip.CRASH
-                        viewModel.updateFilter(
-                            filter.copy(
-                                keyword = "FATAL EXCEPTION|AndroidRuntime",
-                                isRegex = true,
-                                onlyErrors = true
+                        if (selectedQuickChip == QuickKeywordChip.CRASH) {
+                            selectedQuickChip = null
+                            viewModel.updateFilter(filter.copy(keyword = "", isRegex = false, onlyErrors = false))
+                        } else {
+                            selectedQuickChip = QuickKeywordChip.CRASH
+                            viewModel.updateFilter(
+                                filter.copy(
+                                    keyword = "FATAL EXCEPTION|AndroidRuntime",
+                                    isRegex = true,
+                                    onlyErrors = true
+                                )
                             )
-                        )
+                        }
                     }
                 )
                 QuickFilterChip(
                     text = stringResource(Res.string.log_keyword_chip_anr),
                     active = selectedQuickChip == QuickKeywordChip.ANR,
                     onClick = {
-                        selectedQuickChip = QuickKeywordChip.ANR
-                        viewModel.updateFilter(
-                            filter.copy(
-                                keyword = "ANR|Application Not Responding",
-                                isRegex = true,
-                                onlyErrors = false
+                        if (selectedQuickChip == QuickKeywordChip.ANR) {
+                            selectedQuickChip = null
+                            viewModel.updateFilter(filter.copy(keyword = "", isRegex = false))
+                        } else {
+                            selectedQuickChip = QuickKeywordChip.ANR
+                            viewModel.updateFilter(
+                                filter.copy(
+                                    keyword = "ANR|Application Not Responding",
+                                    isRegex = true,
+                                    onlyErrors = false
+                                )
                             )
-                        )
+                        }
                     }
                 )
             }
@@ -496,6 +564,13 @@ fun LogScreen(
                 text = stringResource(Res.string.log_no_device),
                 tone = InlineStatusTone.Warning,
                 icon = IconParkIcons.Refresh
+            )
+        }
+
+        if (clipboardCopyFailed) {
+            InlineStatusBanner(
+                text = l10n("复制失败，请重试", "Copy failed. Please retry."),
+                tone = InlineStatusTone.Warning
             )
         }
 
@@ -550,22 +625,54 @@ fun LogScreen(
                     }
                 } else {
                     Box(modifier = Modifier.fillMaxSize()) {
-                        SelectionContainer {
-                            LazyColumn(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .padding(end = UiTokens.SpaceSmall),
-                                state = listState
-                            ) {
-                                itemsIndexed(filteredLogs, key = { index, item -> "${item.timestamp}_${item.pid}_${index}" }) { index, entry ->
-                                    val rowKey = "${entry.timestamp}_${entry.pid}_$index"
-                                    LogTableRow(
-                                        entry = entry,
-                                        dateFormat = dateFormat,
-                                        isSelected = selectedLogKey == rowKey,
-                                        onClick = { selectedLogKey = rowKey }
-                                    )
-                                }
+                        LazyColumn(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(end = UiTokens.SpaceSmall)
+                                .onGloballyPositioned { logMenuRootPx = it.positionInRoot() }
+                                .pointerInput(filteredLogs, listState) {
+                                    awaitPointerEventScope {
+                                        while (true) {
+                                            val press = awaitPointerEvent()
+                                            if (press.type != PointerEventType.Press || press.button != PointerButton.Primary) continue
+                                            val startChange = press.changes.firstOrNull { it.pressed } ?: continue
+                                            val anchor = logIndexAtY(startChange.position.y, listState)
+                                            if (anchor < 0) continue
+                                            selectedLogs = listOf(filteredLogs[anchor])
+                                            var current = anchor
+                                            var primaryStillDown = true
+                                            while (primaryStillDown) {
+                                                val move = awaitPointerEvent()
+                                                for (change in move.changes) {
+                                                    if (change.pressed) {
+                                                        val idx = logIndexAtY(change.position.y, listState)
+                                                        if (idx >= 0 && idx != current) {
+                                                            current = idx
+                                                            selectedLogs = snapshotLogSelection(filteredLogs, anchor, idx)
+                                                        }
+                                                    } else if (change.id == startChange.id) {
+                                                        primaryStillDown = false
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                },
+                            state = listState
+                        ) {
+                            itemsIndexed(filteredLogs, key = { index, item -> "${item.timestamp}_${item.pid}_${index}" }) { index, entry ->
+                                LogTableRow(
+                                    entry = entry,
+                                    dateFormat = dateFormat,
+                                    isSelected = selectedLogs.any { it === entry },
+                                    onRightClick = { clickInRoot ->
+                                        if (!selectedLogs.any { it === entry }) {
+                                            selectedLogs = listOf(entry)
+                                        }
+                                        logMenuOffsetPx = clickInRoot - logMenuRootPx
+                                        logMenuExpanded = true
+                                    }
+                                )
                             }
                         }
                         VerticalScrollbar(
@@ -576,6 +683,60 @@ fun LogScreen(
                                 .padding(end = UiTokens.SpaceXSmall)
                                 .padding(vertical = UiTokens.SpaceSmall)
                         )
+
+                        // 右键菜单
+                        if (logMenuExpanded) {
+                            val selectedCount = selectedLogs.size
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .clickable(
+                                        indication = null,
+                                        interactionSource = remember { MutableInteractionSource() }
+                                    ) { logMenuExpanded = false }
+                            )
+                            androidx.compose.material.DropdownMenu(
+                                expanded = logMenuExpanded,
+                                onDismissRequest = { logMenuExpanded = false },
+                                offset = with(density) {
+                                    DpOffset(logMenuOffsetPx.x.toDp(), logMenuOffsetPx.y.toDp())
+                                },
+                                modifier = Modifier.width(200.dp)
+                            ) {
+                                if (selectedCount > 0) {
+                                    androidx.compose.material.DropdownMenuItem(
+                                        content = {
+                                            Text(
+                                                if (selectedCount == 1) l10n("复制这条日志", "Copy log")
+                                                else l10n("复制选中的 $selectedCount 条", "Copy $selectedCount selected logs")
+                                            )
+                                        },
+                                        onClick = {
+                                            val text = selectedLogs
+                                                .joinToString("\n") { formatLogLine(it, dateFormat) }
+                                            clipboardCopyFailed = !copyTextToClipboard(text)
+                                            logMenuExpanded = false
+                                        }
+                                    )
+                                }
+                                androidx.compose.material.DropdownMenuItem(
+                                    content = { Text(l10n("全选", "Select all")) },
+                                    onClick = {
+                                        selectedLogs = filteredLogs.toList()
+                                        logMenuExpanded = false
+                                    }
+                                )
+                                if (selectedCount > 0) {
+                                    androidx.compose.material.DropdownMenuItem(
+                                        content = { Text(l10n("取消选择", "Clear selection"), color = MaterialTheme.colorScheme.error) },
+                                        onClick = {
+                                            selectedLogs = emptyList()
+                                            logMenuExpanded = false
+                                        }
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -829,17 +990,19 @@ private fun HeaderCell(text: String, width: androidx.compose.ui.unit.Dp? = null,
     )
 }
 
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class, ExperimentalComposeUiApi::class)
 @Composable
 private fun LogTableRow(
     entry: LogEntry,
     dateFormat: SimpleDateFormat,
     isSelected: Boolean,
-    onClick: () -> Unit
+    onRightClick: (Offset) -> Unit
 ) {
     val interactionSource = remember { MutableInteractionSource() }
     val hovered by interactionSource.collectIsHoveredAsState()
+    var rowRootPx by remember(entry.timestamp) { mutableStateOf(Offset.Zero) }
     val rowBackground = when {
-        isSelected -> MaterialTheme.colorScheme.primary.copy(alpha = 0.07f)
+        isSelected -> MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)
         entry.level == LogLevel.ERROR || entry.level == LogLevel.FATAL -> QadbColors.errorSurface
         entry.level == LogLevel.WARN -> QadbColors.warningSurface
         hovered -> QadbColors.surfaceHover
@@ -851,7 +1014,17 @@ private fun LogTableRow(
             .fillMaxWidth()
             .background(rowBackground)
             .hoverable(interactionSource = interactionSource)
-            .clickable(onClick = onClick)
+            .onGloballyPositioned { rowRootPx = it.positionInRoot() }
+            .pointerInput(entry, onRightClick) {
+                awaitPointerEventScope {
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        if (event.button == PointerButton.Secondary && event.type == PointerEventType.Press) {
+                            onRightClick(rowRootPx + event.changes.first().position)
+                        }
+                    }
+                }
+            }
             .padding(horizontal = UiTokens.SpaceSmall, vertical = UiTokens.SpaceSmall),
         verticalAlignment = Alignment.Top
     ) {

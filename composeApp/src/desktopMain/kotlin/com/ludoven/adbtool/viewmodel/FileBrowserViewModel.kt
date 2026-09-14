@@ -8,6 +8,7 @@ import com.ludoven.adbtool.entity.MsgContent
 import com.ludoven.adbtool.util.AdbTool
 import com.ludoven.adbtool.util.FileUtils
 import com.ludoven.adbtool.util.l10n
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -29,6 +30,12 @@ internal fun fileListLoadShouldApply(
         path == currentPath?.trim().orEmpty() &&
         deviceId == currentDeviceId?.trim().orEmpty()
 }
+
+internal fun snapshotUploadTargets(localPaths: List<String>, directory: String): List<Pair<String, String>> =
+    localPaths.filter(String::isNotBlank).distinct().map { localPath ->
+        val fileName = localPath.substringAfterLast('/').substringAfterLast('\\')
+        localPath to "${directory.trimEnd('/')}/$fileName"
+    }
 
 class FileBrowserViewModel : BaseViewModel() {
 
@@ -371,6 +378,38 @@ class FileBrowserViewModel : BaseViewModel() {
                 loadFiles(deviceId = deviceId, forceRefresh = true)
             } else {
                 showToast(MsgContent.Text(l10n("推送失败: ${result.errorMessage ?: result.output}", "Push failed: ${result.errorMessage ?: result.output}")))
+            }
+        }
+    }
+
+    fun pushFiles(localPaths: List<String>, deviceId: String?) {
+        if (deviceId.isNullOrBlank()) return
+        val targetDirectory = _currentPath.value
+        val targets = snapshotUploadTargets(localPaths, targetDirectory)
+        if (targets.isEmpty()) return
+        viewModelScope.launch {
+            val failures = mutableListOf<String>()
+            for ((localPath, destPath) in targets) {
+                val result = try {
+                    AdbTool.execAdbAsync("-s", deviceId, "push", localPath, destPath)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (error: Exception) {
+                    AdbTool.AdbResult(false, "", error.message ?: error.toString())
+                }
+                if (!result.success) failures += "$localPath: ${result.errorMessage ?: result.output}"
+            }
+            val success = targets.size - failures.size
+            if (failures.isNotEmpty()) {
+                showTipDialog(MsgContent.Text(
+                    l10n("推送完成：成功 $success 个，失败 ${failures.size} 个", "Push done: $success succeeded, ${failures.size} failed") +
+                        "\n" + failures.joinToString("\n")
+                ))
+            } else {
+                showToast(MsgContent.Text(l10n("推送成功：$success 个文件", "Uploaded $success file(s)")))
+            }
+            if (loadingDeviceId == deviceId && loadingPath == targetDirectory) {
+                loadFiles(targetDirectory, deviceId, forceRefresh = true)
             }
         }
     }

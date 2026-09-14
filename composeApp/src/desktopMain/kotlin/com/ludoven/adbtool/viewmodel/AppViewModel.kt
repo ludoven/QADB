@@ -25,6 +25,7 @@ import com.ludoven.adbtool.util.CommandHistoryStore
 import com.ludoven.adbtool.util.CommandHistoryTask
 import com.ludoven.adbtool.util.FileUtils
 import com.ludoven.adbtool.util.l10n
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -233,6 +234,12 @@ class AppViewModel : BaseViewModel() {
     private val _isLoading = MutableStateFlow(false)
     val isLoading = _isLoading.asStateFlow()
 
+    private val _isInstalling = MutableStateFlow(false)
+    val isInstalling = _isInstalling.asStateFlow()
+
+    private val _currentInstallingProgress = MutableStateFlow<String?>(null)
+    val currentInstallingProgress = _currentInstallingProgress.asStateFlow()
+
     // View mode: true = grid, false = list
     private val _isGridView = MutableStateFlow(false)
     val isGridView = _isGridView.asStateFlow()
@@ -339,6 +346,69 @@ class AppViewModel : BaseViewModel() {
                 if (appListLoadShouldApply(normalizedDeviceId, appListLoadDeviceId)) {
                     _isLoading.value = false
                 }
+            }
+        }
+    }
+
+    fun batchInstallFromFolder(deviceId: String?) {
+        batchInstallFromFolder(
+            deviceId = deviceId,
+            selectFolder = { FileUtils.selectFolder() },
+            install = { path, target -> AdbTool.installApkAsync(path, target) },
+            refresh = {
+                if (AdbTool.selectDeviceId == deviceId) getAppList(deviceId, forceRefresh = true)
+            }
+        )
+    }
+
+    internal fun batchInstallFromFolder(
+        deviceId: String?,
+        selectFolder: suspend () -> String?,
+        install: suspend (String, String) -> AdbTool.AdbResult,
+        refresh: () -> Unit
+    ) {
+        if (deviceId.isNullOrBlank() || _isInstalling.value) return
+        _isInstalling.value = true
+        viewModelScope.launch {
+            try {
+                val folder = selectFolder() ?: return@launch
+                val apks = withContext(Dispatchers.IO) {
+                    File(folder).walkTopDown()
+                        .onFail { _, error -> throw error }
+                        .filter { it.isFile && it.extension.equals("apk", ignoreCase = true) }
+                        .sortedBy { it.absolutePath }
+                        .toList()
+                }
+                if (apks.isEmpty()) {
+                    showToast(MsgContent.Text(l10n("所选文件夹中没有 APK 文件", "No APK files found in this folder")))
+                    return@launch
+                }
+                val failures = mutableListOf<String>()
+                _currentInstallingProgress.value = "0/${apks.size}"
+                for ((index, apk) in apks.withIndex()) {
+                    val result = try {
+                        install(apk.absolutePath, deviceId)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        AdbTool.AdbResult(false, "", error.message ?: error.toString())
+                    }
+                    if (!result.success) failures += "${apk.name}: ${result.errorMessage ?: result.output}"
+                    _currentInstallingProgress.value = "${index + 1}/${apks.size}"
+                }
+                refresh()
+                val success = apks.size - failures.size
+                showTipDialog(MsgContent.Text(
+                    l10n("批量安装完成：成功 $success 个，失败 ${failures.size} 个", "Batch installation complete: $success succeeded, ${failures.size} failed") +
+                        if (failures.isEmpty()) "" else "\n" + failures.joinToString("\n")
+                ))
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                showTipDialog(MsgContent.Text(l10n("批量安装失败：", "Batch installation failed: ") + (error.message ?: error.toString())))
+            } finally {
+                _isInstalling.value = false
+                _currentInstallingProgress.value = null
             }
         }
     }

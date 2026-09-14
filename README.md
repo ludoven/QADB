@@ -76,7 +76,7 @@ QADB can make these tasks much easier.
 
 - **Device Management**: Detect USB / network ADB devices and quickly switch the current target device
 - **Device Info**: View model, Android version, screen information, connection status, and more
-- **App Management**: Install APKs, uninstall apps, clear data, force stop apps, and export APKs
+- **App Management**: Install APKs, uninstall apps, clear data, force stop apps, and export APKs; batch-install APKs from a folder and double-click to inspect an app
 - **Common Operations**: Reboot, shutdown, screenshot, screen recording, open settings, inspect current Activity, etc.
 - **Key Event Simulation**: Quickly trigger common key events such as Back, Home, Menu, Volume, and D-pad keys
 - **Built-in Terminal**: Run adb / shell commands directly inside the app
