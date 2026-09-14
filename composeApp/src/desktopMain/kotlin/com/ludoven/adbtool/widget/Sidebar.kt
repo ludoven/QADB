@@ -1,5 +1,7 @@
 package com.ludoven.adbtool.widget
 
+import com.ludoven.adbtool.ui.icons.AiAgentBrandIcon
+
 import com.ludoven.adbtool.ui.mac.*
 
 import adbtool_desktop.composeapp.generated.resources.Res
@@ -216,12 +218,19 @@ private fun SidebarGroupHeader(
             .padding(horizontal = 24.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Icon(
-            imageVector = group.icon,
-            contentDescription = group.label,
-            tint = if (group.id == "ai") MaterialTheme.colorScheme.primary else contentColor,
-            modifier = Modifier.size(if (group.id == "ai") UiTokens.IconLarge else 19.dp)
-        )
+        if (group.id == "ai") {
+            AiAgentBrandIcon(
+                contentDescription = group.label,
+                modifier = Modifier.size(UiTokens.IconLarge)
+            )
+        } else {
+            Icon(
+                imageVector = group.icon,
+                contentDescription = group.label,
+                tint = contentColor,
+                modifier = Modifier.size(19.dp)
+            )
+        }
         Spacer(modifier = Modifier.width(UiTokens.SpaceLarge))
         Text(
             text = group.label,
@@ -311,12 +320,19 @@ private fun SidebarItem(
             Spacer(modifier = Modifier.width(UiTokens.SpaceMedium))
         }
 
-        Icon(
-            imageVector = item.icon,
-            contentDescription = item.title,
-            tint = contentColor,
+        if (item.route == "ai") {
+            AiAgentBrandIcon(
+                contentDescription = item.title,
                 modifier = Modifier.size(UiTokens.IconMedium)
-        )
+            )
+        } else {
+            Icon(
+                imageVector = item.icon,
+                contentDescription = item.title,
+                tint = contentColor,
+                modifier = Modifier.size(UiTokens.IconMedium)
+            )
+        }
 
         Spacer(modifier = Modifier.width(UiTokens.SpaceSmall))
 

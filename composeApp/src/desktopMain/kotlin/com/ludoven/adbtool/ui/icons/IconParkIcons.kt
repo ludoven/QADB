@@ -8,10 +8,11 @@ import compose.icons.tablericons.*
  * QADB's semantic icon catalogue.
  *
  * The legacy name is retained so that existing screens keep their stable API;
- * every vector is supplied by Tabler Icons (MIT, outline style).
+ * most vectors are supplied by Tabler Icons (MIT, outline style), while
+ * product-specific marks use QADB-owned vectors.
  */
 object IconParkIcons {
-    val AiAssistant: ImageVector get() = TablerIcons.Stars
+    val AiAssistant: ImageVector get() = AiAgentLogo
     val Application: ImageVector get() = TablerIcons.Apps
     val ArrowDown: ImageVector get() = TablerIcons.ChevronDown
     val BatteryFull: ImageVector get() = TablerIcons.Battery4

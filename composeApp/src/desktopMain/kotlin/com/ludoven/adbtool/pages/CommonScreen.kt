@@ -107,6 +107,10 @@ import com.ludoven.adbtool.util.CustomCommandManager
 import com.ludoven.adbtool.util.copyPlainTextToClipboard
 import com.ludoven.adbtool.util.l10n
 import com.ludoven.adbtool.viewmodel.CommonModel
+import com.ludoven.adbtool.viewmodel.BatchDeviceResult
+import com.ludoven.adbtool.viewmodel.BatchDeviceStatus
+import com.ludoven.adbtool.viewmodel.BatchExecutionUiState
+import com.ludoven.adbtool.viewmodel.BatchExecutionViewModel
 import com.ludoven.adbtool.widget.InlineStatusBanner
 import com.ludoven.adbtool.widget.InlineStatusTone
 import java.io.InputStreamReader
@@ -158,13 +162,36 @@ private fun displayCommandTitle(command: CommandItemUi): String {
 internal fun commonCommandRunEnabled(selectedDevice: String?): Boolean =
     !selectedDevice.isNullOrBlank()
 
+internal fun commonBatchCommandSupported(actionType: AdbFunctionType?): Boolean =
+    actionType !in setOf(
+        AdbFunctionType.INSTALL_APK,
+        AdbFunctionType.INSTALL_AND_LAUNCH,
+        AdbFunctionType.DEVICE_MIRROR,
+        AdbFunctionType.SCREENSHOT,
+        AdbFunctionType.SCREEN_RECORD,
+        AdbFunctionType.CAPTURE_LOGS
+    )
+
+internal fun commonBatchCommandIsDestructive(actionType: AdbFunctionType?): Boolean =
+    actionType in setOf(
+        AdbFunctionType.REBOOT_DEVICE,
+        AdbFunctionType.CLEAR_CACHE_AND_RESTART
+    )
+
+private fun CommandItemUi.supportsBatchExecution(): Boolean =
+    commonBatchCommandSupported(actionType) && (actionType != null || !shellCommand.isNullOrBlank())
+
 @Composable
 @Preview
 fun CommonScreen(
     viewModel: CommonModel,
-    selectedDevice: String? = null
+    batchViewModel: BatchExecutionViewModel,
+    selectedDevice: String? = null,
+    devices: List<String> = emptyList(),
+    deviceDisplayNames: Map<String, String> = emptyMap()
 ) {
     val coroutineScope = rememberCoroutineScope()
+    val batchState by batchViewModel.uiState.collectAsState()
 
     var favoriteIds by remember { mutableStateOf(CommandFavoritesManager.load()) }
     var customCommands by remember { mutableStateOf(CustomCommandManager.load()) }
@@ -217,6 +244,15 @@ fun CommonScreen(
     var executionResult by remember { mutableStateOf(l10n("等待执行", "Ready")) }
     var showRebootConfirm by remember { mutableStateOf(false) }
     var pendingRebootCommand by remember { mutableStateOf<CommandItemUi?>(null) }
+    var batchMode by remember { mutableStateOf(false) }
+    var batchDevicesExpanded by remember { mutableStateOf(true) }
+    var selectedBatchDeviceIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var showBatchConfirm by remember { mutableStateOf(false) }
+    var pendingBatchCommand by remember { mutableStateOf<CommandItemUi?>(null) }
+
+    LaunchedEffect(devices) {
+        selectedBatchDeviceIds = selectedBatchDeviceIds.intersect(devices.toSet())
+    }
 
     val filteredCommands by remember(mergedCommands, selectedCategory, searchKeyword, favoriteIds) {
         derivedStateOf {
@@ -304,7 +340,97 @@ fun CommonScreen(
         copyPlainTextToClipboard(command)
     }
 
+    suspend fun executeCommandOnDevice(
+        command: CommandItemUi,
+        deviceId: String,
+        packageNameInput: String,
+        shellCommandInput: String,
+        textInput: String
+    ): AdbTool.AdbResult {
+        return when (command.trigger) {
+            CommandTrigger.PACKAGE_INPUT -> {
+                val pkg = packageNameInput.trim()
+                when (command.actionType) {
+                    AdbFunctionType.LAUNCH_APP_BY_PACKAGE -> AdbTool.startAppAsync(pkg, deviceId)
+                    AdbFunctionType.STOP_APP_BY_PACKAGE -> AdbTool.stopAppAsync(pkg, deviceId)
+                    AdbFunctionType.CLEAR_CACHE_AND_RESTART -> {
+                        val cleared = AdbTool.clearAppDataAsync(pkg, deviceId)
+                        if (cleared.success) AdbTool.startAppAsync(pkg, deviceId) else cleared
+                    }
+                    else -> AdbTool.AdbResult(false, "", "Unsupported package action: ${command.actionType}")
+                }
+            }
+
+            CommandTrigger.SHELL_INPUT -> {
+                val shell = (command.shellCommand ?: shellCommandInput.trim())
+                    .replace("{package}", packageNameInput.trim())
+                    .replace("{text}", textInput.trim())
+                AdbTool.execShellAsync(shell, deviceId)
+            }
+
+            CommandTrigger.DIRECT -> {
+                if (!command.shellCommand.isNullOrBlank()) {
+                    val shell = command.shellCommand
+                        .replace("{package}", packageNameInput.trim())
+                        .replace("{text}", textInput.trim())
+                    return AdbTool.execShellAsync(shell, deviceId)
+                }
+
+                when (command.actionType) {
+                    null -> {
+                        val args = customAdbArgs(
+                            rawCommand = command.commandPreview,
+                            deviceId = deviceId,
+                            packageName = packageNameInput,
+                            text = textInput
+                        )
+                        if (args.isEmpty()) {
+                            AdbTool.AdbResult(false, "", "ADB command cannot be empty")
+                        } else {
+                            AdbTool.execAdbAsync(*args.toTypedArray())
+                        }
+                    }
+
+                    AdbFunctionType.INPUT_TEXT -> AdbTool.execShellAsync(
+                        AdbTool.buildShellCommand("input", "text", textInput),
+                        deviceId
+                    )
+
+                    else -> viewModel.executeAdbActionOnDevice(command.actionType, deviceId)
+                }
+            }
+        }
+    }
+
     fun executeCommand(command: CommandItemUi) {
+        if (batchMode) {
+            if (!command.supportsBatchExecution()) {
+                executionResult = l10n("此命令暂不支持批量执行", "This command is not supported in batch mode")
+                return
+            }
+            if (selectedBatchDeviceIds.isEmpty()) {
+                executionResult = l10n("执行失败：请至少选择一台设备", "Failed: select at least one device")
+                return
+            }
+            if (command.trigger == CommandTrigger.PACKAGE_INPUT && packageNameInput.isBlank()) {
+                executionResult = l10n("执行失败：包名不能为空", "Failed: package name cannot be empty")
+                return
+            }
+            if (command.trigger == CommandTrigger.SHELL_INPUT &&
+                (command.shellCommand ?: shellCommandInput).isBlank()
+            ) {
+                executionResult = l10n("执行失败：Shell 命令不能为空", "Failed: shell command cannot be empty")
+                return
+            }
+            if (command.actionType == AdbFunctionType.INPUT_TEXT && textInput.isBlank()) {
+                executionResult = l10n("执行失败：输入文本不能为空", "Failed: input text cannot be empty")
+                return
+            }
+            pendingBatchCommand = command
+            showBatchConfirm = true
+            executionResult = l10n("等待批量执行确认...", "Awaiting batch confirmation...")
+            return
+        }
         if (!commonCommandRunEnabled(selectedDevice)) {
             executionResult = l10n("执行失败：未选择设备", "Failed: no device selected")
             return
@@ -465,14 +591,32 @@ fun CommonScreen(
                 categories = categories,
                 selectedCategory = selectedCategory,
                 onCategorySelected = { selectedCategory = it },
-                onAddCommand = { showAddCommandDialog = true }
+                onAddCommand = { showAddCommandDialog = true },
+                batchMode = batchMode,
+                onBatchModeChange = { enabled ->
+                    batchMode = enabled
+                    if (enabled && selectedBatchDeviceIds.isEmpty()) {
+                        selectedBatchDeviceIds = selectedDevice?.takeIf { it in devices }?.let(::setOf).orEmpty()
+                    }
+                }
             )
 
-            if (!commonCommandRunEnabled(selectedDevice)) {
+            if (!batchMode && !commonCommandRunEnabled(selectedDevice)) {
                 InlineStatusBanner(
                     text = l10n("当前没有选择设备。命令可以浏览和复制，但执行前需要先连接并选择设备。", "No device is selected. Commands can be browsed and copied, but running them needs a connected selected device."),
                     tone = InlineStatusTone.Warning,
                     icon = IconParkIcons.Info
+                )
+            }
+
+            if (batchMode) {
+                BatchDeviceSelector(
+                    devices = devices,
+                    deviceDisplayNames = deviceDisplayNames,
+                    selectedDeviceIds = selectedBatchDeviceIds,
+                    expanded = batchDevicesExpanded,
+                    onExpandedChange = { batchDevicesExpanded = it },
+                    onSelectionChange = { selectedBatchDeviceIds = it }
                 )
             }
 
@@ -515,11 +659,105 @@ fun CommonScreen(
                     onCopyCommand = ::copyCommand,
                     onClearResult = { executionResult = l10n("等待执行", "Ready") },
                     onExecuteCommand = ::executeCommand,
-                    canRunCommand = commonCommandRunEnabled(selectedDevice),
+                    canRunCommand = if (batchMode) {
+                        selectedBatchDeviceIds.isNotEmpty() && selectedCommand?.supportsBatchExecution() == true
+                    } else {
+                        commonCommandRunEnabled(selectedDevice)
+                    },
                     modifier = Modifier.weight(1f)
                 )
+
+                if (batchState.visible) {
+                    BatchResultPanel(
+                        state = batchState,
+                        deviceDisplayNames = deviceDisplayNames,
+                        onRetryFailed = batchViewModel::retryFailed,
+                        onClose = batchViewModel::closePanel,
+                        modifier = Modifier.widthIn(min = 320.dp, max = 400.dp)
+                    )
+                }
             }
         }
+    }
+
+    if (showBatchConfirm) {
+        val command = pendingBatchCommand
+        val destructive = commonBatchCommandIsDestructive(command?.actionType)
+        AlertDialog(
+            onDismissRequest = {
+                showBatchConfirm = false
+                pendingBatchCommand = null
+            },
+            title = {
+                Text(command?.let(::displayCommandTitle) ?: l10n("批量执行", "Batch execution"))
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(UiTokens.SpaceSmall)) {
+                    Text(
+                        if (destructive) {
+                            l10n(
+                                "此操作不可撤销，将影响 ${selectedBatchDeviceIds.size} 台设备。",
+                                "This cannot be undone and will affect ${selectedBatchDeviceIds.size} devices."
+                            )
+                        } else {
+                            l10n(
+                                "将在 ${selectedBatchDeviceIds.size} 台设备上执行：",
+                                "Run on ${selectedBatchDeviceIds.size} devices:"
+                            )
+                        },
+                        color = if (destructive) QadbColors.danger else MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        resolvedCommandPreview,
+                        fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    selectedBatchDeviceIds.forEach { deviceId ->
+                        Text("• ${deviceDisplayNames[deviceId] ?: deviceId}", style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val confirmedCommand = pendingBatchCommand ?: return@TextButton
+                        val targets = selectedBatchDeviceIds.toList()
+                        val confirmedPackageName = packageNameInput
+                        val confirmedShellCommand = shellCommandInput
+                        val confirmedText = textInput
+                        showBatchConfirm = false
+                        pendingBatchCommand = null
+                        executionResult = l10n("批量执行中...", "Batch running...")
+                        batchViewModel.execute(
+                            commandTitle = displayCommandTitle(confirmedCommand),
+                            commandPreview = resolvedCommandPreview,
+                            deviceIds = targets
+                        ) { deviceId ->
+                            executeCommandOnDevice(
+                                confirmedCommand, deviceId,
+                                confirmedPackageName, confirmedShellCommand, confirmedText
+                            )
+                        }
+                    },
+                    modifier = if (destructive) {
+                        Modifier.background(QadbColors.danger.copy(alpha = 0.12f), RoundedCornerShape(UiTokens.RadiusSmall))
+                    } else Modifier
+                ) {
+                    Text(
+                        l10n("确认执行", "Run"),
+                        color = if (destructive) QadbColors.danger else MaterialTheme.colorScheme.primary
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    showBatchConfirm = false
+                    pendingBatchCommand = null
+                    executionResult = l10n("已取消", "Cancelled")
+                }) { Text(l10n("取消", "Cancel")) }
+            },
+            containerColor = MaterialTheme.colorScheme.surface
+        )
     }
 
     if (showRebootConfirm) {
@@ -792,13 +1030,278 @@ private fun fallbackCommands(): List<CommandItemUi> = listOf(
 )
 
 @Composable
+private fun BatchDeviceSelector(
+    devices: List<String>,
+    deviceDisplayNames: Map<String, String>,
+    selectedDeviceIds: Set<String>,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    onSelectionChange: (Set<String>) -> Unit
+) {
+    Card(
+        shape = RoundedCornerShape(UiTokens.RadiusMedium),
+        colors = CardDefaults.cardColors(containerColor = QadbColors.surfaceSelected),
+        border = BorderStroke(1.dp, QadbColors.selectedBorder),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(UiTokens.SpaceMedium)) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { onExpandedChange(!expanded) },
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(UiTokens.SpaceSmall)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.ScreenSearchDesktop,
+                        contentDescription = null,
+                        tint = QadbColors.primary,
+                        modifier = Modifier.size(UiTokens.IconMedium)
+                    )
+                    Text(
+                        l10n("已选择 ${selectedDeviceIds.size} 台设备", "${selectedDeviceIds.size} devices selected"),
+                        fontWeight = FontWeight.SemiBold,
+                        color = QadbColors.primary
+                    )
+                }
+                Icon(
+                    imageVector = Icons.Default.KeyboardArrowDown,
+                    contentDescription = null,
+                    tint = QadbColors.primary,
+                    modifier = Modifier.size(UiTokens.IconMedium)
+                )
+            }
+
+            if (expanded) {
+                Spacer(Modifier.height(UiTokens.SpaceSmall))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(UiTokens.SpaceSmall)
+                ) {
+                    TextButton(
+                        onClick = { onSelectionChange(devices.toSet()) },
+                        enabled = devices.isNotEmpty()
+                    ) { Text(l10n("全选在线设备", "Select all online"), color = QadbColors.primary) }
+                    TextButton(
+                        onClick = { onSelectionChange(emptySet()) },
+                        enabled = selectedDeviceIds.isNotEmpty()
+                    ) { Text(l10n("清空", "Clear")) }
+                }
+
+                if (devices.isEmpty()) {
+                    Text(
+                        l10n("没有在线设备", "No online devices"),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(UiTokens.SpaceSmall),
+                        verticalArrangement = Arrangement.spacedBy(UiTokens.SpaceSmall)
+                    ) {
+                        devices.forEach { deviceId ->
+                            val checked = deviceId in selectedDeviceIds
+                            Row(
+                                modifier = Modifier
+                                    .widthIn(min = 210.dp)
+                                    .background(
+                                        if (checked) MaterialTheme.colorScheme.surface else Color.Transparent,
+                                        RoundedCornerShape(UiTokens.RadiusSmall)
+                                    )
+                                    .clickable {
+                                        onSelectionChange(
+                                            if (checked) selectedDeviceIds - deviceId else selectedDeviceIds + deviceId
+                                        )
+                                    }
+                                    .padding(horizontal = UiTokens.SpaceSmall, vertical = UiTokens.SpaceXSmall),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(UiTokens.SpaceSmall)
+                            ) {
+                                Checkbox(
+                                    checked = checked,
+                                    onCheckedChange = { isChecked ->
+                                        onSelectionChange(
+                                            if (isChecked) selectedDeviceIds + deviceId else selectedDeviceIds - deviceId
+                                        )
+                                    }
+                                )
+                                Box(
+                                    Modifier.size(8.dp).background(QadbColors.success, RoundedCornerShape(UiTokens.BadgeRadius))
+                                )
+                                Column {
+                                    Text(
+                                        deviceDisplayNames[deviceId] ?: deviceId,
+                                        fontWeight = FontWeight.Medium,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    if (deviceDisplayNames.containsKey(deviceId)) {
+                                        Text(
+                                            deviceId,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BatchResultPanel(
+    state: BatchExecutionUiState,
+    deviceDisplayNames: Map<String, String>,
+    onRetryFailed: () -> Unit,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    var expandedDeviceIds by remember(state.commandTitle, state.commandPreview) { mutableStateOf(emptySet<String>()) }
+    Card(
+        shape = RoundedCornerShape(UiTokens.RadiusMedium),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+        modifier = modifier.fillMaxHeight()
+    ) {
+        Column(
+            modifier = Modifier.fillMaxSize().padding(UiTokens.SpaceMedium),
+            verticalArrangement = Arrangement.spacedBy(UiTokens.SpaceMedium)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(state.commandTitle, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(
+                        l10n(
+                            "${state.completedCount}/${state.devices.size} 完成",
+                            "${state.completedCount}/${state.devices.size} complete"
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                TextButton(onClick = onClose, enabled = !state.isRunning) { Text(l10n("关闭", "Close")) }
+            }
+
+            LazyColumn(
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(UiTokens.SpaceSmall)
+            ) {
+                itemsIndexed(state.devices.values.toList(), key = { _, item -> item.deviceId }) { _, result ->
+                    BatchResultRow(
+                        result = result,
+                        displayName = deviceDisplayNames[result.deviceId] ?: result.deviceId,
+                        expanded = result.deviceId in expandedDeviceIds,
+                        onToggleExpanded = {
+                            expandedDeviceIds = if (result.deviceId in expandedDeviceIds) {
+                                expandedDeviceIds - result.deviceId
+                            } else {
+                                expandedDeviceIds + result.deviceId
+                            }
+                        }
+                    )
+                }
+            }
+
+            if (!state.isRunning && state.failedCount > 0) {
+                CommandActionButton(
+                    text = l10n("重试失败的 ${state.failedCount} 台", "Retry ${state.failedCount} failed"),
+                    icon = Icons.Default.RestartAlt,
+                    onClick = onRetryFailed,
+                    primary = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun BatchResultRow(
+    result: BatchDeviceResult,
+    displayName: String,
+    expanded: Boolean,
+    onToggleExpanded: () -> Unit
+) {
+    val statusColor = when (result.status) {
+        BatchDeviceStatus.PENDING, BatchDeviceStatus.RUNNING -> QadbColors.primary
+        BatchDeviceStatus.SUCCESS -> QadbColors.success
+        BatchDeviceStatus.FAILED -> QadbColors.danger
+    }
+    val statusMark = when (result.status) {
+        BatchDeviceStatus.PENDING -> "…"
+        BatchDeviceStatus.RUNNING -> "↻"
+        BatchDeviceStatus.SUCCESS -> "✓"
+        BatchDeviceStatus.FAILED -> "×"
+    }
+    val summary = when (result.status) {
+        BatchDeviceStatus.PENDING -> l10n("等待中", "Pending")
+        BatchDeviceStatus.RUNNING -> l10n("执行中", "Running")
+        BatchDeviceStatus.SUCCESS -> l10n("成功 · ${result.durationMillis ?: 0} ms", "Success · ${result.durationMillis ?: 0} ms")
+        BatchDeviceStatus.FAILED -> result.errorMessage ?: result.output.ifBlank { l10n("命令执行失败", "Command failed") }
+    }
+    val details = listOf(result.output, result.errorMessage.orEmpty()).filter(String::isNotBlank).distinct().joinToString("\n")
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f), RoundedCornerShape(UiTokens.RadiusSmall))
+            .clickable(enabled = details.isNotBlank()) { onToggleExpanded() }
+            .padding(UiTokens.SpaceSmall),
+        verticalArrangement = Arrangement.spacedBy(UiTokens.SpaceXSmall)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(UiTokens.SpaceSmall)) {
+            Text(statusMark, color = statusColor, fontWeight = FontWeight.Bold)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(displayName, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(
+                    summary,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = statusColor,
+                    maxLines = if (expanded) Int.MAX_VALUE else 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+        if (expanded && details.isNotBlank()) {
+            SelectionContainer {
+                Text(
+                    details,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun CommandCenterHeader(
     searchKeyword: String,
     onSearchKeywordChange: (String) -> Unit,
     categories: List<CommandCategoryUi>,
     selectedCategory: String,
     onCategorySelected: (String) -> Unit,
-    onAddCommand: () -> Unit
+    onAddCommand: () -> Unit,
+    batchMode: Boolean,
+    onBatchModeChange: (Boolean) -> Unit
 ) {
     Column(
         modifier = Modifier.fillMaxWidth(),
@@ -870,6 +1373,19 @@ private fun CommandCenterHeader(
                 onClick = onAddCommand,
                 primary = true,
                 modifier = Modifier.height(38.dp)
+            )
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.End
+        ) {
+            CommandActionButton(
+                text = l10n("批量模式", "Batch"),
+                icon = Icons.Default.ScreenSearchDesktop,
+                onClick = { onBatchModeChange(!batchMode) },
+                primary = batchMode,
+                modifier = Modifier.width(120.dp).height(32.dp)
             )
         }
 

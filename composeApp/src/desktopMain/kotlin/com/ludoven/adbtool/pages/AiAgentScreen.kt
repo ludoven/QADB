@@ -1,5 +1,7 @@
 package com.ludoven.adbtool.pages
 
+import com.ludoven.adbtool.ui.icons.AiAgentBrandIcon
+
 import adbtool_desktop.composeapp.generated.resources.*
 import adbtool_desktop.composeapp.generated.resources.Res
 import adbtool_desktop.composeapp.generated.resources.agent_back_to_latest
@@ -1106,11 +1108,9 @@ private fun AgentGuideHeroIcon() {
             ),
         contentAlignment = Alignment.Center
     ) {
-        Icon(
-            imageVector = IconParkIcons.AiAssistant,
+        AiAgentBrandIcon(
             contentDescription = null,
-            tint = QadbTokens.ai,
-            modifier = Modifier.size(26.dp)
+            modifier = Modifier.size(38.dp)
         )
     }
 }

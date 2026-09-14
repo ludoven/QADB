@@ -82,7 +82,8 @@ QADB can make these tasks much easier.
 - **Built-in Terminal**: Run adb / shell commands directly inside the app
 - **Log Viewer**: View and filter Logcat logs to troubleshoot runtime issues
 - **Diagnostics**: Inspect Logcat and device processes together, including process search, sorting, and resource usage
-- **Command Center**: Organize frequently used ADB commands into visual actions
+- **Command Center**: Organize frequently used ADB commands into visual actions, with multi-device execution, per-device results, and failed-device retry
+  - Batch inputs are fixed at confirmation and reused for failed-device retries; results are isolated between batches.
 - **AI Agent Beta**: Off by default; when enabled, provides device-operation assistance with human review
 - **TV / Box Debugging**: Suitable for Android TV, set-top boxes, and system app debugging scenarios
 - **Cross-Platform**: Built on Compose Multiplatform, supports Windows, macOS, and Linux
@@ -310,7 +311,7 @@ Yes. The release workflow produces `.deb`, `.rpm`, and `.tar.gz` artifacts. Devi
 - [ ] Performance monitoring
 - [ ] Command favorites
 - [ ] Custom command grouping
-- [ ] Multi-device batch operations
+- [x] Multi-device batch operations (Command Center v1)
 - [ ] Plugin-based command extensions
 
 ---

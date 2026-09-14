@@ -98,6 +98,7 @@ import com.ludoven.adbtool.viewmodel.LogViewModel
 import com.ludoven.adbtool.widget.FeedbackToast
 import com.ludoven.adbtool.widget.WirelessConnectionDialog
 import com.ludoven.adbtool.viewmodel.ScreenRecordUiState
+import com.ludoven.adbtool.viewmodel.BatchExecutionViewModel
 import com.ludoven.adbtool.viewmodel.TerminalViewModel
 import com.ludoven.adbtool.widget.Sidebar
 import kotlinx.coroutines.delay
@@ -115,6 +116,7 @@ fun App() {
     val devicesViewModel: DevicesViewModel = viewModel()
     val appViewModel: AppViewModel = viewModel()
     val commonModel: CommonModel = viewModel()
+    val batchExecutionViewModel: BatchExecutionViewModel = viewModel()
     val deviceMirrorViewModel: DeviceMirrorViewModel = viewModel()
     val keyEventViewModel: KeyEventViewModel = viewModel()
     val logViewModel: LogViewModel = viewModel()
@@ -440,10 +442,15 @@ fun App() {
                                 }
                                 composable("common") {
                                     stateHolder.SaveableStateProvider("common") {
+                                        val devices by devicesViewModel.devices.collectAsState()
                                         val selectedDevice by devicesViewModel.selectedDevice.collectAsState()
+                                        val deviceDisplayNames by devicesViewModel.deviceDisplayNames.collectAsState()
                                         CommonScreen(
                                             viewModel = commonModel,
-                                            selectedDevice = selectedDevice
+                                            batchViewModel = batchExecutionViewModel,
+                                            selectedDevice = selectedDevice,
+                                            devices = devices,
+                                            deviceDisplayNames = deviceDisplayNames
                                         )
                                     }
                                 }

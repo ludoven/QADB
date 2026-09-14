@@ -83,6 +83,32 @@ class CommonModel : BaseViewModel() {
 
     private var activeScreenRecordSession: ScreenRecordSession? = null
 
+    suspend fun executeAdbActionOnDevice(
+        type: AdbFunctionType,
+        deviceId: String
+    ): AdbTool.AdbResult {
+        if (deviceId.isBlank()) {
+            return AdbTool.AdbResult(false, "", "Device ID is required")
+        }
+        val shellCommand = when (type) {
+            AdbFunctionType.OPEN_FILE_MANAGER -> "am start -a android.intent.action.VIEW -d file:///sdcard"
+            AdbFunctionType.KEY_BACK -> "input keyevent 4"
+            AdbFunctionType.KEY_HOME -> "input keyevent 3"
+            AdbFunctionType.VIEW_CURRENT_ACTIVITY -> "dumpsys window | grep mCurrentFocus"
+            AdbFunctionType.REBOOT_DEVICE -> "reboot"
+            AdbFunctionType.IS_ROOTED -> "su -c id"
+            AdbFunctionType.WIFI_INFO -> "dumpsys wifi"
+            AdbFunctionType.CPU_INFO -> "top -n 1"
+            AdbFunctionType.NETWORK_STATUS -> "dumpsys connectivity"
+            AdbFunctionType.BATTERY_STATUS -> "dumpsys battery"
+            AdbFunctionType.SCREEN_RESOLUTION -> "wm size"
+            AdbFunctionType.DEVELOPER_OPTIONS ->
+                "am start -a android.settings.APPLICATION_DEVELOPMENT_SETTINGS"
+            else -> return AdbTool.AdbResult(false, "", "Unsupported batch action: $type")
+        }
+        return AdbTool.execShellAsync(shellCommand, deviceId)
+    }
+
     fun executeAdbAction(
         type: AdbFunctionType
     ) {
