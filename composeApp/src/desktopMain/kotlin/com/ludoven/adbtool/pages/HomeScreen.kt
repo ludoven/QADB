@@ -92,6 +92,7 @@ import com.ludoven.adbtool.ui.mac.Icon
 import com.ludoven.adbtool.ui.mac.MaterialTheme
 import com.ludoven.adbtool.ui.mac.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -116,6 +117,7 @@ import com.ludoven.adbtool.entity.DeviceInfoData
 import com.ludoven.adbtool.ui.icons.IconParkIcons
 import com.ludoven.adbtool.util.AdbTool
 import com.ludoven.adbtool.util.AdbPathManager
+import com.ludoven.adbtool.util.NetworkConnectMemory
 import com.ludoven.adbtool.util.isWirelessAdbConnection
 import com.ludoven.adbtool.util.l10n
 import com.ludoven.adbtool.viewmodel.DevicesViewModel
@@ -217,6 +219,12 @@ fun HomeScreen(
         if (devices.isEmpty()) {
             viewModel.refreshDevices()
         }
+    }
+
+    // 首页可见期间，CPU 使用率每 5 秒轮询刷新一次
+    DisposableEffect(selectedDevice) {
+        viewModel.startCpuPolling(selectedDevice)
+        onDispose { viewModel.stopCpuPolling() }
     }
 
     val isConnected = homeDeviceConnected(selectedDevice)
@@ -542,8 +550,9 @@ private fun HomeNetworkConnectCard(
     onConnect: (String, String) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    var ip by remember { mutableStateOf("192.168.1.1") }
-    var port by remember { mutableStateOf("5555") }
+    val saved = remember { NetworkConnectMemory.load() }
+    var ip by remember { mutableStateOf(saved.ip) }
+    var port by remember { mutableStateOf(saved.port) }
 
     GlassCard(
         modifier = modifier.fillMaxWidth(),
@@ -589,7 +598,12 @@ private fun HomeNetworkConnectCard(
                 )
                 PrimaryHomeButton(
                     text = if (isLoading) l10n("连接中...", "Connecting...") else l10n("连接", "Connect"),
-                    onClick = { if (!isLoading) onConnect(ip, port) }
+                    onClick = {
+                        if (!isLoading) {
+                            NetworkConnectMemory.save(ip, port)
+                            onConnect(ip, port)
+                        }
+                    }
                 )
             }
             Row(

@@ -13,7 +13,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -29,6 +31,11 @@ private data class DeviceCommandOutputs(
     val dataDf: String,
     val battery: String,
     val latencyMs: Long
+)
+
+private data class CpuSample(
+    val idle: Long,
+    val total: Long
 )
 
 internal fun deviceInfoLoadShouldApply(requestedDeviceId: String?, selectedDeviceId: String?): Boolean {
@@ -78,6 +85,55 @@ class DevicesViewModel : BaseViewModel() {
 
     private var deviceInfoLoadJob: Job? = null
     private var deviceInfoLoadDeviceId: String? = null
+
+    private var cpuPollJob: Job? = null
+    private var cpuPrevSample: CpuSample? = null
+
+    /**
+     * 每隔 5 秒轮询一次 CPU 使用率，并更新首页指标卡片。
+     */
+    fun startCpuPolling(deviceId: String?) {
+        cpuPollJob?.cancel()
+        val normalizedDeviceId = normalizedDeviceId(deviceId)
+        if (normalizedDeviceId == null) {
+            cpuPrevSample = null
+            return
+        }
+        cpuPollJob = viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                cpuPrevSample = readCpuSample(normalizedDeviceId)
+            }
+            while (isActive) {
+                delay(5_000)
+                withContext(Dispatchers.IO) {
+                    val sample = readCpuSample(normalizedDeviceId) ?: return@withContext
+                    val prev = cpuPrevSample
+                    cpuPrevSample = sample
+                    if (prev != null && sample.total > prev.total && sample.idle >= prev.idle) {
+                        val idleDelta = sample.idle - prev.idle
+                        val totalDelta = sample.total - prev.total
+                        val percent = (100 - (idleDelta * 100) / totalDelta).coerceIn(0, 100)
+                        _centerInfo.update { it?.copy(cpuUsage = "$percent%") }
+                    }
+                }
+            }
+        }
+    }
+
+    fun stopCpuPolling() {
+        cpuPollJob?.cancel()
+        cpuPollJob = null
+        cpuPrevSample = null
+    }
+
+    private suspend fun readCpuSample(deviceId: String): CpuSample? {
+        val cpuLine = AdbTool.execAdbOutputAsync("-s", deviceId, "shell", "cat", "/proc/stat")
+            .lines()
+            .firstOrNull { it.startsWith("cpu ") }
+        val values = cpuLine?.split(Regex("\\s+"))?.drop(1)?.mapNotNull { it.toLongOrNull() }
+        if (values == null || values.size < 7) return null
+        return CpuSample(idle = values[3] + values[4], total = values.sum())
+    }
 
     fun refreshDevices() {
         viewModelScope.launch {
