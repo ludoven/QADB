@@ -950,6 +950,14 @@ class AppViewModel : BaseViewModel() {
                                 showTipDialog(MsgContent.Resource(Res.string.dialog_uninstall_failed))
                             }
                         }
+                        AdbFunctionType.DISABLE_APP -> {
+                            AdbTool.exec(appPackageShellCommand("su", "0", "pm", "disable-user", packageName))
+                            withContext(Dispatchers.Main) { getAppList(forceRefresh = true) }
+                        }
+                        AdbFunctionType.ENABLE_APP -> {
+                            AdbTool.exec(appPackageShellCommand("su", "0", "pm", "enable", packageName))
+                            withContext(Dispatchers.Main) { getAppList(forceRefresh = true) }
+                        }
                         AdbFunctionType.LAUNCH -> {
                             AdbTool.exec(
                                 appPackageShellCommand(

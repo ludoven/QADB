@@ -1126,6 +1126,15 @@ private fun AppListRow(
                 contextMenuExpanded = false
                 onAction(AdbFunctionType.APP_INFO)
             }
+            AppActionMenuItem(
+                icon = if (app.isDisabled) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                text = if (app.isDisabled) l10n("启用应用", "Enable app")
+                else l10n("禁用应用", "Disable app"),
+                iconTint = AppVisualTokens.Primary
+            ) {
+                contextMenuExpanded = false
+                onAction(if (app.isDisabled) AdbFunctionType.ENABLE_APP else AdbFunctionType.DISABLE_APP)
+            }
             HorizontalDivider(
                 modifier = Modifier.padding(horizontal = UiTokens.SpaceMedium, vertical = UiTokens.SpaceXSmall),
                 color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.2f)
@@ -1507,6 +1516,15 @@ private fun AppGridCard(
             ) {
                 contextMenuExpanded = false
                 onAction(AdbFunctionType.EXPORT_APK)
+            }
+            AppActionMenuItem(
+                icon = if (app.isDisabled) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                text = if (app.isDisabled) l10n("启用应用", "Enable app")
+                else l10n("禁用应用", "Disable app"),
+                iconTint = AppVisualTokens.Primary
+            ) {
+                contextMenuExpanded = false
+                onAction(if (app.isDisabled) AdbFunctionType.ENABLE_APP else AdbFunctionType.DISABLE_APP)
             }
             HorizontalDivider(
                 modifier = Modifier.padding(horizontal = UiTokens.SpaceMedium, vertical = UiTokens.SpaceXSmall),
