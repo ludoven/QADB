@@ -71,7 +71,8 @@ data class AppInfo(
     val sizeBytes: Long? = null,
     val installTimestamp: Long? = null,
     val lastUsedTimestamp: Long? = null,
-    val isRunning: Boolean = false
+    val isRunning: Boolean = false,
+    val memoryBytes: Long? = null
 )
 
 private fun AppInfoData.toAppInfo(): AppInfo = AppInfo(
@@ -88,7 +89,8 @@ internal enum class AppFilter(val key: String) {
     SYSTEM("system"),
     DEBUGGABLE("debug"),
     RECENT("recent"),
-    RUNNING("running");
+    RUNNING("running"),
+    DISABLED("disabled");
 
     fun matches(app: AppInfo): Boolean {
         return when (this) {
@@ -98,6 +100,7 @@ internal enum class AppFilter(val key: String) {
             DEBUGGABLE -> app.isDebuggable
             RECENT -> (app.lastUsedTimestamp ?: app.installTimestamp ?: 0L) > 0L
             RUNNING -> app.isRunning
+            DISABLED -> app.isDisabled
         }
     }
 
@@ -110,6 +113,7 @@ internal enum class AppFilter(val key: String) {
                 "可调试应用" -> DEBUGGABLE
                 "最近使用" -> RECENT
                 "运行中" -> RUNNING
+                "禁用" -> DISABLED
                 else -> ALL
             }
         }
@@ -119,6 +123,7 @@ internal enum class AppFilter(val key: String) {
 private enum class AppSortMode {
     Name,
     Size,
+    Memory,
     Version,
     InstallTime,
     Recent
@@ -287,6 +292,15 @@ fun AppScreen(
     var confirmActionLabel by remember { mutableStateOf("") }
     var confirmActionMessage by remember { mutableStateOf("") }
     var sortMode by remember { mutableStateOf(AppSortMode.Name) }
+    var sortAscending by remember { mutableStateOf(true) }
+    fun toggleSort(column: AppSortMode) {
+        if (sortMode == column) {
+            sortAscending = !sortAscending
+        } else {
+            sortMode = column
+            sortAscending = true
+        }
+    }
 
     val hasSelectedDevice = !selectedDevice.isNullOrBlank()
 
@@ -299,6 +313,7 @@ fun AppScreen(
 
     val tabs = remember { AppFilter.entries.toList() }
     val selectedFilter = remember(selectedTab) { AppFilter.fromKey(selectedTab) }
+    val showMemory = selectedFilter == AppFilter.RUNNING
     LaunchedEffect(selectedFilter, selectedDevice) {
         if (selectedFilter == AppFilter.RUNNING && hasSelectedDevice) {
             viewModel.refreshRunningStatusAsync()
@@ -307,14 +322,16 @@ fun AppScreen(
     val filteredList = remember(appList, selectedFilter, searchText) {
         filterApps(appList, selectedFilter, searchText)
     }
-    val displayedList = remember(filteredList, sortMode) {
-        when (sortMode) {
+    val displayedList = remember(filteredList, sortMode, sortAscending) {
+        val list = when (sortMode) {
             AppSortMode.Name -> filteredList.sortedBy { it.appName.lowercase() }
-            AppSortMode.Size -> filteredList.sortedByDescending { it.sizeBytes ?: -1L }
-            AppSortMode.Version -> filteredList.sortedByDescending { it.versionName }
-            AppSortMode.InstallTime -> filteredList.sortedByDescending { it.installTimestamp ?: 0L }
-            AppSortMode.Recent -> filteredList.sortedByDescending { it.lastUsedTimestamp ?: it.installTimestamp ?: 0L }
+            AppSortMode.Size -> filteredList.sortedBy { it.sizeBytes ?: -1L }
+            AppSortMode.Memory -> filteredList.sortedBy { it.memoryBytes ?: -1L }
+            AppSortMode.Version -> filteredList.sortedBy { it.versionName }
+            AppSortMode.InstallTime -> filteredList.sortedBy { it.installTimestamp ?: 0L }
+            AppSortMode.Recent -> filteredList.sortedBy { it.lastUsedTimestamp ?: it.installTimestamp ?: 0L }
         }
+        if (sortAscending) list else list.reversed()
     }
     val tabCountMap = remember(appList) {
         appFilterCounts(appList)
@@ -614,13 +631,14 @@ fun AppScreen(
                         }
                     }
                     Column(modifier = Modifier.fillMaxSize().padding(horizontal = UiTokens.SpaceMedium, vertical = UiTokens.SpaceSmall)) {
-                        AppListColumnHeader()
+                        AppListColumnHeader(showMemory, sortMode, sortAscending, ::toggleSort)
                         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                             LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
                                 items(displayedList, key = { it.packageName }) { app ->
                                     AppListRow(
                                         app = app,
                                         icon = appIcons[app.packageName],
+                                        showMemory = showMemory,
                                         onAction = { type -> viewModel.executeAdbAction(type, app.packageName) },
                                         onCopyPackageName = { viewModel.copyToClipboard(app.packageName) },
                                         onRequestDangerAction = { type, label, message ->
@@ -683,6 +701,7 @@ private fun appSortModeLabel(mode: AppSortMode): String {
     return when (mode) {
         AppSortMode.Name -> l10n("按名称", "By name")
         AppSortMode.Size -> l10n("按大小", "By size")
+        AppSortMode.Memory -> l10n("按运存", "By memory")
         AppSortMode.Version -> l10n("按版本", "By version")
         AppSortMode.InstallTime -> l10n("按安装时间", "By install time")
         AppSortMode.Recent -> l10n("按最近使用", "By recent")
@@ -697,6 +716,7 @@ private fun appTabLabel(filter: AppFilter): String {
         AppFilter.DEBUGGABLE -> l10n("可调试应用", "Debuggable")
         AppFilter.RECENT -> l10n("最近使用", "Recent")
         AppFilter.RUNNING -> l10n("运行中", "Running")
+        AppFilter.DISABLED -> l10n("禁用", "Disabled")
     }
 }
 
@@ -784,7 +804,12 @@ private fun ViewToggleButton(
 private const val DOUBLE_CLICK_DELAY_NANOS = 500_000_000L
 
 @Composable
-private fun AppListColumnHeader() {
+private fun AppListColumnHeader(
+    showMemory: Boolean,
+    sortMode: AppSortMode,
+    sortAscending: Boolean,
+    onSortToggle: (AppSortMode) -> Unit
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -795,9 +820,76 @@ private fun AppListColumnHeader() {
         AppColumnHeaderText(l10n("应用", "App"), Modifier.weight(2.25f))
         AppColumnHeaderText(l10n("类型", "Type"), Modifier.weight(1.25f))
         AppColumnHeaderText(l10n("版本", "Version"), Modifier.weight(0.85f))
-        AppColumnHeaderText(l10n("大小", "Size"), Modifier.weight(0.75f))
+        AppSortableHeaderText(
+            text = l10n("大小", "Size"),
+            column = AppSortMode.Size,
+            sortMode = sortMode,
+            sortAscending = sortAscending,
+            onSortToggle = onSortToggle,
+            modifier = Modifier.weight(0.75f)
+        )
+        if (showMemory) {
+            AppSortableHeaderText(
+                text = l10n("运存", "Memory"),
+                column = AppSortMode.Memory,
+                sortMode = sortMode,
+                sortAscending = sortAscending,
+                onSortToggle = onSortToggle,
+                modifier = Modifier.weight(0.75f)
+            )
+        }
         AppColumnHeaderText(l10n("状态", "Status"), Modifier.weight(0.9f))
         AppColumnHeaderText(l10n("操作", "Actions"), Modifier.weight(0.52f))
+    }
+}
+
+@Composable
+private fun AppSortableHeaderText(
+    text: String,
+    column: AppSortMode,
+    sortMode: AppSortMode,
+    sortAscending: Boolean,
+    onSortToggle: (AppSortMode) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val active = sortMode == column
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(UiTokens.RadiusSmall))
+            .clickable { onSortToggle(column) }
+            .padding(vertical = UiTokens.SpaceXSmall),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.labelSmall,
+            color = if (active) MaterialTheme.colorScheme.primary else AppVisualTokens.Muted,
+            fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        if (active) {
+            Icon(
+                imageVector = if (sortAscending) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                contentDescription = null,
+                modifier = Modifier.size(12.dp),
+                tint = MaterialTheme.colorScheme.primary
+            )
+        }
+    }
+}
+
+private fun formatAppSize(bytes: Long): String {
+    if (bytes <= 0L) return "-"
+    val kb = bytes / 1024.0
+    val mb = kb / 1024.0
+    val gb = mb / 1024.0
+    return when {
+        gb >= 1.0 -> String.format("%.2f GB", gb)
+        mb >= 1.0 -> String.format("%.1f MB", mb)
+        kb >= 1.0 -> String.format("%.0f KB", kb)
+        else -> "$bytes B"
     }
 }
 
@@ -918,6 +1010,7 @@ private fun SortableHeaderLabel(
 private fun AppListRow(
     app: AppInfo,
     icon: ImageBitmap?,
+    showMemory: Boolean = false,
     onAction: (AdbFunctionType) -> Unit,
     onCopyPackageName: () -> Unit,
     onRequestDangerAction: (AdbFunctionType, String, String) -> Unit,
@@ -1026,6 +1119,17 @@ private fun AppListRow(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
+
+            if (showMemory) {
+                Text(
+                    text = app.memoryBytes?.let { formatAppSize(it) } ?: "-",
+                    modifier = Modifier.weight(0.75f),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = AppVisualTokens.Text,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
 
             Box(modifier = Modifier.weight(0.9f)) {
                 val statusText = when {
@@ -1150,6 +1254,19 @@ private fun AppListRow(
                     AdbFunctionType.UNINSTALL,
                     l10n("确认卸载应用", "Confirm uninstall"),
                     l10n("将从设备卸载 ${appName}，请确认继续。", "App ${appName} will be uninstalled from device. Continue?")
+                )
+            }
+            AppActionMenuItem(
+                icon = Icons.Default.DeleteSweep,
+                text = l10n("超级卸载", "Super uninstall"),
+                iconTint = AppVisualTokens.Danger,
+                textColor = AppVisualTokens.Danger
+            ) {
+                contextMenuExpanded = false
+                onRequestDangerAction(
+                    AdbFunctionType.SUPER_UNINSTALL,
+                    l10n("确认超级卸载", "Confirm super uninstall"),
+                    l10n("将以 root 权限卸载 ${appName}（可能重挂载 system）。该操作不可撤销。", "App ${appName} will be uninstalled with root permission (system may be remounted). This cannot be undone.")
                 )
             }
             }
@@ -1541,6 +1658,19 @@ private fun AppGridCard(
                     AdbFunctionType.UNINSTALL,
                     l10n("确认卸载应用", "Confirm uninstall"),
                     l10n("将从设备卸载 ${app.appName}，请确认继续。", "App ${app.appName} will be uninstalled from device. Continue?")
+                )
+            }
+            AppActionMenuItem(
+                icon = Icons.Default.DeleteSweep,
+                text = l10n("超级卸载", "Super uninstall"),
+                iconTint = AppVisualTokens.Danger,
+                textColor = AppVisualTokens.Danger
+            ) {
+                contextMenuExpanded = false
+                onRequestDangerAction(
+                    AdbFunctionType.SUPER_UNINSTALL,
+                    l10n("确认超级卸载", "Confirm super uninstall"),
+                    l10n("将以 root 权限卸载 ${app.appName}（可能重挂载 system）。该操作不可撤销。", "App ${app.appName} will be uninstalled with root permission (system may be remounted). This cannot be undone.")
                 )
             }
             }

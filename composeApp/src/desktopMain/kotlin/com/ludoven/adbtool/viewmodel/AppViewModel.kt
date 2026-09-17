@@ -78,10 +78,15 @@ internal suspend fun loadInstalledAppsForDevice(): List<AppInfo> = coroutineScop
     val allAppsDef = async { AdbTool.exec("pm list packages -f") }
     val sysAppsDef = async { AdbTool.exec("pm list packages -s") }
     val disabledAppsDef = async { AdbTool.exec("pm list packages -d") }
+    val versionsDef = async {
+        runCatching { parseAllVersionNames(AdbTool.exec("dumpsys package")) }
+            .getOrDefault(emptyMap())
+    }
 
     val allApps = allAppsDef.await() ?: return@coroutineScope emptyList()
     val sysApps = sysAppsDef.await() ?: ""
     val disabledApps = disabledAppsDef.await() ?: ""
+    val versionNames = versionsDef.await()
     val sysPackages = sysApps.lines()
         .mapNotNull { it.substringAfter("package:", "").takeIf { p -> p.isNotEmpty() } }
         .toSet()
@@ -89,7 +94,7 @@ internal suspend fun loadInstalledAppsForDevice(): List<AppInfo> = coroutineScop
         .mapNotNull { it.substringAfter("package:", "").takeIf { p -> p.isNotEmpty() } }
         .toSet()
 
-    allApps.lines().mapNotNull { line ->
+    val apps = allApps.lines().mapNotNull { line ->
         val match = packageLineRegex.find(line)
         val (apkPath, packageName) = match?.destructured ?: return@mapNotNull null
         val debugHint = packageName.contains("debug", ignoreCase = true) || packageName.endsWith(".dev")
@@ -101,7 +106,93 @@ internal suspend fun loadInstalledAppsForDevice(): List<AppInfo> = coroutineScop
             isDebuggable = debugHint,
             isDisabled = disabledPackages.contains(packageName)
         )
+    }
+    // 版本与大小直接获取，不做懒加载
+    val sizeBytesMap = queryBulkApkSizes(apps.map { it.apkPath })
+    apps.map { app ->
+        val sizeBytes = sizeBytesMap[app.apkPath]
+        app.copy(
+            versionName = versionNames[app.packageName] ?: "-",
+            size = sizeBytes?.let { formatAppSize(it) } ?: "-",
+            sizeBytes = sizeBytes
+        )
     }.sortedBy { it.packageName }
+}
+
+private fun formatAppSize(bytes: Long): String {
+    if (bytes <= 0L) return "-"
+    val kb = bytes / 1024.0
+    val mb = kb / 1024.0
+    val gb = mb / 1024.0
+    return when {
+        gb >= 1.0 -> String.format("%.2f GB", gb)
+        mb >= 1.0 -> String.format("%.1f MB", mb)
+        kb >= 1.0 -> String.format("%.0f KB", kb)
+        else -> "$bytes B"
+    }
+}
+
+// 从 dumpsys package 一次性解析所有应用的 versionName
+private fun parseAllVersionNames(dumpsys: String): Map<String, String> {
+    val result = mutableMapOf<String, String>()
+    var currentPackage: String? = null
+    val packageHeaderRegex = Regex("""^  Package \[([^\]]+)] \(""")
+    val versionNameRegex = Regex("""^    versionName=(.*)$""")
+    dumpsys.lineSequence().forEach { line ->
+        val pkgMatch = packageHeaderRegex.find(line)
+        if (pkgMatch != null) {
+            currentPackage = pkgMatch.groupValues[1]
+        } else if (currentPackage != null) {
+            val versionMatch = versionNameRegex.find(line)
+            if (versionMatch != null) {
+                result[currentPackage!!] = versionMatch.groupValues[1].trim()
+                currentPackage = null
+            }
+        }
+    }
+    return result
+}
+
+// 批量获取 APK 大小：优先 du，失败回退 stat
+private suspend fun queryBulkApkSizes(paths: List<String>): Map<String, Long> {
+    val distinctPaths = paths.filter { it.isNotBlank() }.distinct()
+    if (distinctPaths.isEmpty()) return emptyMap()
+
+    val duSizes = queryBulkDuSizeBytes(distinctPaths)
+    if (duSizes.isNotEmpty()) {
+        return distinctPaths.mapNotNull { path ->
+            duSizes[path]?.let { path to it }
+        }.toMap()
+    }
+    return queryBulkStatSizeBytes(distinctPaths)
+}
+
+private fun queryBulkDuSizeBytes(paths: List<String>): Map<String, Long> {
+    val result = mutableMapOf<String, Long>()
+    for (chunk in paths.chunked(80)) {
+        val output = AdbTool.exec(AdbTool.buildShellCommand("du", "-s", *chunk.toTypedArray()))
+        output.lineSequence().forEach { line ->
+            val trimmed = line.trim()
+            if (trimmed.isBlank()) return@forEach
+            val parts = trimmed.split(Regex("\\s+"), limit = 2)
+            if (parts.size < 2) return@forEach
+            val sizeKb = parts[0].toLongOrNull() ?: return@forEach
+            result[parts[1]] = sizeKb * 1024L
+        }
+    }
+    return result
+}
+
+private fun queryBulkStatSizeBytes(paths: List<String>): Map<String, Long> {
+    val result = mutableMapOf<String, Long>()
+    for (chunk in paths.chunked(80)) {
+        val output = AdbTool.exec(AdbTool.buildShellCommand("stat", "-c", "%s", *chunk.toTypedArray()))
+        val sizes = output.lineSequence().mapNotNull { it.trim().toLongOrNull() }.toList()
+        chunk.forEachIndexed { index, path ->
+            sizes.getOrNull(index)?.let { result[path] = it }
+        }
+    }
+    return result
 }
 
 class AppViewModel : BaseViewModel() {
@@ -234,6 +325,8 @@ class AppViewModel : BaseViewModel() {
                 _appList.value = list
                 hydrateCachedLabels(list)
                 markAppListLoaded(traceSessionId, list.size, listStartedAt)
+                // 列表重载后重新填充运行状态，避免“运行中”页在刷新后被清空
+                scheduleRunningStatusRefresh(delayMillis = 0L)
                 if (isFullIconPrefetchEnabled()) {
                     scheduleAllIconPrefetch(traceSessionId, normalizedDeviceId, list)
                 }
@@ -913,12 +1006,58 @@ class AppViewModel : BaseViewModel() {
     private fun refreshRunningStatus() {
         val runningProcesses = AdbTool.exec("dumpsys activity processes")
         val runningPackages = parseRunningPackagesFromActivityProcesses(runningProcesses)
+        // 优先用显式列 ps 解析运存，失败时回退默认 ps 格式
+        val memoryBytesByPackage = parseMemoryBytes(AdbTool.exec("ps -A -o PID,RSS,NAME"))
+            .ifEmpty { parseMemoryBytesFromDefaultPs(AdbTool.exec("ps -A")) }
 
-        if (runningPackages.isEmpty()) return
+        if (runningPackages.isEmpty() && memoryBytesByPackage.isEmpty()) return
 
         _appList.value = _appList.value.map { app ->
-            app.copy(isRunning = runningPackages.contains(app.packageName))
+            app.copy(
+                isRunning = if (runningPackages.isNotEmpty()) {
+                    runningPackages.contains(app.packageName)
+                } else {
+                    app.isRunning
+                },
+                memoryBytes = memoryBytesByPackage[app.packageName]
+            )
         }
+    }
+
+    // 解析 "ps -o PID,RSS,NAME" 输出：每行三列 PID RSS NAME
+    private fun parseMemoryBytes(psOutput: String): Map<String, Long> {
+        val result = mutableMapOf<String, Long>()
+        psOutput.lineSequence().forEach { line ->
+            val trimmed = line.trim()
+            if (trimmed.isBlank() || trimmed.startsWith("PID") || trimmed.startsWith("USER")) return@forEach
+            val parts = trimmed.split(Regex("\\s+"), limit = 3)
+            if (parts.size < 3) return@forEach
+            val rssKb = parts[1].toLongOrNull() ?: return@forEach
+            val name = parts[2]
+            if (name.contains(".")) {
+                val pkg = name.substringBefore(":")
+                result[pkg] = (result[pkg] ?: 0L) + rssKb * 1024L
+            }
+        }
+        return result
+    }
+
+    // 回退解析默认 "ps -A" 输出：RSS 为第 5 列
+    private fun parseMemoryBytesFromDefaultPs(psOutput: String): Map<String, Long> {
+        val result = mutableMapOf<String, Long>()
+        psOutput.lineSequence().forEach { line ->
+            val trimmed = line.trim()
+            if (trimmed.isBlank() || trimmed.startsWith("USER") || trimmed.startsWith("PID")) return@forEach
+            val parts = trimmed.split(Regex("\\s+"))
+            if (parts.size < 5) return@forEach
+            val rssKb = parts[4].toLongOrNull() ?: return@forEach
+            val name = parts.last()
+            if (name.contains(".")) {
+                val pkg = name.substringBefore(":")
+                result[pkg] = (result[pkg] ?: 0L) + rssKb * 1024L
+            }
+        }
+        return result
     }
 
     fun setSearchText(text: String) {
@@ -941,6 +1080,24 @@ class AppViewModel : BaseViewModel() {
                     when (type) {
                         AdbFunctionType.UNINSTALL -> {
                             val result = AdbTool.exec(appPackageShellCommand("pm", "uninstall", packageName))
+                            if (result.contains("Success")) {
+                                withContext(Dispatchers.Main) {
+                                    getAppList(forceRefresh = true)
+                                    showTipDialog(MsgContent.Resource(Res.string.dialog_uninstall_success))
+                                }
+                            } else {
+                                showTipDialog(MsgContent.Resource(Res.string.dialog_uninstall_failed))
+                            }
+                        }
+                        AdbFunctionType.SUPER_UNINSTALL -> {
+                            // root 卸载：尝试将 system 重挂载为可写，然后以 root 卸载
+                            runCatching {
+                                AdbTool.exec(appPackageShellCommand("su", "0", "mount", "-o", "remount,rw", "/system"))
+                                AdbTool.exec(appPackageShellCommand("su", "0", "mount", "-o", "remount,rw", "/"))
+                            }
+                            val result = AdbTool.exec(
+                                appPackageShellCommand("su", "0", "pm", "uninstall", "--user", "0", packageName)
+                            )
                             if (result.contains("Success")) {
                                 withContext(Dispatchers.Main) {
                                     getAppList(forceRefresh = true)

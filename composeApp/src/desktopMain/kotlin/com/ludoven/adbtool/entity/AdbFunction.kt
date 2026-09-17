@@ -39,6 +39,7 @@ enum class AdbFunctionType() {
 
     //APP
     UNINSTALL,
+    SUPER_UNINSTALL, // root 权限超级卸载
     DISABLE_APP, // 禁用应用 (需 root)
     ENABLE_APP, // 启用应用 (需 root)
     LAUNCH,
