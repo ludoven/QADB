@@ -14,6 +14,7 @@
 | macOS | `.dmg` | 适用于 macOS 用户 |
 | Linux | `.deb` | Debian / Ubuntu / Linux Mint 等发行版 |
 | Linux | `.rpm` | Fedora / openSUSE / RHEL 系发行版 |
+| Linux | `.pkg.tar.zst` | Arch Linux / Manjaro 等发行版 |
 | Linux | `.tar.gz` | 解压即用（便携包） |
 
 ## macOS 打开提示
