@@ -1006,9 +1006,9 @@ class AppViewModel : BaseViewModel() {
     private fun refreshRunningStatus() {
         val runningProcesses = AdbTool.exec("dumpsys activity processes")
         val runningPackages = parseRunningPackagesFromActivityProcesses(runningProcesses)
-        // 优先用显式列 ps 解析运存，失败时回退默认 ps 格式
-        val memoryBytesByPackage = parseMemoryBytes(AdbTool.exec("ps -A -o PID,RSS,NAME"))
-            .ifEmpty { parseMemoryBytesFromDefaultPs(AdbTool.exec("ps -A")) }
+        // 部分设备（旧 toolbox）不支持 -A/-o，ps 直接列出全部进程；toybox 设备则需 -A
+        val memoryBytesByPackage = parseMemoryBytes(AdbTool.exec("ps"))
+            .ifEmpty { parseMemoryBytes(AdbTool.exec("ps -A")) }
 
         if (runningPackages.isEmpty() && memoryBytesByPackage.isEmpty()) return
 
@@ -1024,37 +1024,32 @@ class AppViewModel : BaseViewModel() {
         }
     }
 
-    // 解析 "ps -o PID,RSS,NAME" 输出：每行三列 PID RSS NAME
+    // 兼容两种 ps 输出布局：
+    //   默认布局 USER PID PPID VSIZE RSS ... NAME（RSS 第 4 列，NAME 最后）
+    //   "-o PID,RSS,NAME" 布局 PID RSS NAME（首列为数字）
     private fun parseMemoryBytes(psOutput: String): Map<String, Long> {
         val result = mutableMapOf<String, Long>()
         psOutput.lineSequence().forEach { line ->
             val trimmed = line.trim()
-            if (trimmed.isBlank() || trimmed.startsWith("PID") || trimmed.startsWith("USER")) return@forEach
-            val parts = trimmed.split(Regex("\\s+"), limit = 3)
-            if (parts.size < 3) return@forEach
-            val rssKb = parts[1].toLongOrNull() ?: return@forEach
-            val name = parts[2]
-            if (name.contains(".")) {
-                val pkg = name.substringBefore(":")
-                result[pkg] = (result[pkg] ?: 0L) + rssKb * 1024L
-            }
-        }
-        return result
-    }
-
-    // 回退解析默认 "ps -A" 输出：RSS 为第 5 列
-    private fun parseMemoryBytesFromDefaultPs(psOutput: String): Map<String, Long> {
-        val result = mutableMapOf<String, Long>()
-        psOutput.lineSequence().forEach { line ->
-            val trimmed = line.trim()
-            if (trimmed.isBlank() || trimmed.startsWith("USER") || trimmed.startsWith("PID")) return@forEach
+            if (trimmed.isBlank()) return@forEach
             val parts = trimmed.split(Regex("\\s+"))
-            if (parts.size < 5) return@forEach
-            val rssKb = parts[4].toLongOrNull() ?: return@forEach
-            val name = parts.last()
+            if (parts.size < 3) return@forEach
+            val rssKb: Long?
+            val name: String
+            if (parts[0].toLongOrNull() != null) {
+                // -o PID,RSS,NAME 布局
+                rssKb = parts[1].toLongOrNull()
+                name = parts[2]
+            } else {
+                // 默认布局（表头/数据行统一处理，表头 RSS 列非数字自然跳过）
+                if (parts.size < 5) return@forEach
+                rssKb = parts[4].toLongOrNull()
+                name = parts.last()
+            }
+            val rss = rssKb ?: return@forEach
             if (name.contains(".")) {
                 val pkg = name.substringBefore(":")
-                result[pkg] = (result[pkg] ?: 0L) + rssKb * 1024L
+                result[pkg] = (result[pkg] ?: 0L) + rss * 1024L
             }
         }
         return result
