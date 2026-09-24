@@ -1,5 +1,6 @@
 package com.ludoven.adbtool.agent
 
+import com.ludoven.adbtool.util.l10n
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -86,6 +87,6 @@ class AdvisoryAgentRunnerTest {
         assertEquals("serial", result.boundDeviceId)
         assertEquals("<screen>Settings</screen>", request?.observation?.uiHierarchy)
         assertNull(request?.observation?.screenshotPng)
-        assertTrue(result.messages.last().text.contains("界面信息"))
+        assertTrue(result.messages.last().text.contains(l10n("界面信息", "interface evidence")))
     }
 }

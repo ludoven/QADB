@@ -25,6 +25,7 @@ import com.ludoven.adbtool.agent.NoopAgentSessionHistoryStore
 import com.ludoven.adbtool.agent.AgentSessionHistoryStore
 import com.ludoven.adbtool.agent.SqliteAgentSessionHistoryStore
 import com.ludoven.adbtool.agent.artemis.DeviceLeaseManager
+import com.ludoven.adbtool.util.l10n
 import java.nio.file.Files
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -196,7 +197,7 @@ class AiAgentViewModelStartTaskTest {
         viewModel.newTask()
         assertEquals(AgentStopOutcome.NONE, viewModel.state.value.stopOutcome)
         viewModel.startTask("第二个任务", "emulator-5554")
-        assertTrue(viewModel.state.value.errorMessage.orEmpty().contains("未决"))
+        assertTrue(viewModel.state.value.errorMessage.orEmpty().contains(l10n("未决", "unresolved")))
         viewModel.startTask("另一台设备的任务", "emulator-5556")
         viewModel.awaitUntil("other device run starts") {
             it.isRunning && it.boundDeviceId == "emulator-5556"
@@ -212,7 +213,7 @@ class AiAgentViewModelStartTaskTest {
         val failed = viewModel.awaitUntil("runner exception is visible") {
             !it.isRunning && it.phase == AgentRunPhase.FAILED
         }
-        assertEquals("智能体任务失败，请重试。", failed.errorMessage)
+        assertEquals(l10n("智能体任务失败，请重试。", "The agent task failed. Please retry."), failed.errorMessage)
         assertNotNull(failed.failure)
     }
 
