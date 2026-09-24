@@ -1568,6 +1568,37 @@ class AgentProviderProtocolTest {
     }
 
     @Test
+    fun `disabled streaming returns plain text without tool calling capability`() = runBlocking {
+        var requestBody = ""
+        val server = server { exchange ->
+            requestBody = exchange.requestBody.bufferedReader().use { it.readText() }
+            exchange.respond(200, messageResponse("text-only answer", 3, 2), contentType = "application/json")
+        }
+        try {
+            val provider = resolvedProvider(
+                providerProfile("http://127.0.0.1:${server.address.port}").copy(
+                    capabilities = AgentCapabilities(text = true, toolCalling = false),
+                    streamingMode = AgentStreamingMode.DISABLED,
+                    limits = AgentProviderLimits(maxOutputTokens = 256, timeoutMs = 2_000, maxRetries = 0)
+                )
+            ).copy(role = AgentModelRole.RESPONDER)
+            val chunks = mutableListOf<String>()
+            val result = OpenAiCompatibleClient().streamUserAnswer(provider, modelContext(), false) {
+                chunks += it
+            }
+
+            assertEquals(listOf("text-only answer"), chunks)
+            assertFalse(result.usedStreaming)
+            assertEquals(5, result.decision.usage.totalTokens)
+            val payload = Json.parseToJsonElement(requestBody).jsonObject
+            assertFalse(payload["stream"]?.jsonPrimitive?.boolean ?: true)
+            assertTrue(payload["tools"] == null)
+        } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
     fun `SSE user answer emits content deltas and records final usage`() = runBlocking {
         var requestBody = ""
         val events = mutableListOf<AgentModelAttemptEvent>()

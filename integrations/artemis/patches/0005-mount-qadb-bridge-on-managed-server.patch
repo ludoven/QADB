@@ -1,0 +1,28 @@
+diff --git a/apps/admin_console/server.py b/apps/admin_console/server.py
+index 151bb82..4307d68 100644
+--- a/apps/admin_console/server.py
++++ b/apps/admin_console/server.py
+@@ -118,6 +118,23 @@ app.state.lifecycle_token = LIFECYCLE_TOKEN
+ app.add_middleware(SameOriginBoundaryMiddleware)
+ 
+ 
++def _mount_qadb_bridge() -> None:
++    """Mount QADB control routes on this managed server, never a sidecar port."""
++    if os.environ.get("QADB_BRIDGE_ENABLED") != "1":
++        return
++    token = os.environ.get("QADB_BRIDGE_TOKEN")
++    ledger_path = os.environ.get("QADB_BRIDGE_LEDGER")
++    if not token or not ledger_path:
++        raise RuntimeError("QADB Bridge requires QADB_BRIDGE_TOKEN and QADB_BRIDGE_LEDGER")
++    from qadb_bridge import QadbBridge, SqliteBridgeLedger
++    from qadb_bridge_app import create_router
++
++    app.include_router(create_router(QadbBridge(token, ledger=SqliteBridgeLedger(ledger_path))))
++
++
++_mount_qadb_bridge()
++
++
+ async def on_startup():
+     """Startup lifecycle hooks."""
+     state.is_shutting_down = False

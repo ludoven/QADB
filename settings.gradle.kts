@@ -48,3 +48,17 @@ if (includeAndroidHelpers) {
     include(":qadb-icon-helper")
     include(":qadb-agent-ime")
 }
+
+val includeArtemisEvaluationFixture = providers.gradleProperty("qadb.includeArtemisEvaluationFixture")
+    .map { value ->
+        when (value.lowercase()) {
+            "true" -> true
+            "false" -> false
+            else -> error("qadb.includeArtemisEvaluationFixture must be true or false")
+        }
+    }
+    .getOrElse(false)
+
+if (includeArtemisEvaluationFixture) {
+    include(":qadb-artemis-evaluation-fixture")
+}

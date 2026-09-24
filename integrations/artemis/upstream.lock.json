@@ -1,0 +1,27 @@
+{
+  "upstream": {
+    "repository": "https://github.com/google/artemis",
+    "commit": "371aa6df56880643da57b30da936e9812fb0ec66",
+    "license": "Apache-2.0"
+  },
+  "protocol": {
+    "version": "artemis-http-v0.1",
+    "verifiedSourceFiles": [
+      "apps/admin_console/routers/tasks.py",
+      "apps/admin_console/schemas/task_schema.py",
+      "packages/artemis-client/README.md"
+    ]
+  },
+  "runtime": {
+    "status": "not-packaged",
+    "python": null,
+    "dependencyLockHash": null,
+    "patchesHash": null
+  },
+  "verification": {
+    "sourceReviewedAt": "2026-09-20",
+    "daemonExecuted": false,
+    "deviceExecuted": false,
+    "modelExecuted": false
+  }
+}

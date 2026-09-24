@@ -322,17 +322,46 @@ class OpenAiCompatibleClient(
             ?: throw ModelProtocolException("The model response does not contain choices")
         val message = choices.firstOrNull()?.jsonObject?.get("message")?.jsonObject
             ?: throw ModelProtocolException("The model response does not contain a message")
-        val calls = message["tool_calls"]?.jsonArray
-            ?: throw ModelProtocolException("The model did not return a structured tool call")
-        if (calls.size != 1) throw ModelProtocolException("The model must return exactly one tool call per step")
-        val function = calls.single().jsonObject["function"]?.jsonObject
-            ?: throw ModelProtocolException("The tool call is missing function data")
+        val calls = message["tool_calls"] as? JsonArray
+        val function = when {
+            calls != null -> {
+                if (calls.size != 1) {
+                    throw ModelProtocolException("The model must return exactly one tool call per step")
+                }
+                (calls.single() as? JsonObject)?.get("function") as? JsonObject
+                    ?: throw ModelProtocolException("The tool call is missing function data")
+            }
+            message["function_call"] is JsonObject -> message["function_call"] as JsonObject
+            else -> parseToolCallFromContent(message)
+        }
         val name = function["name"]?.jsonPrimitive?.contentOrNull
             ?: throw ModelProtocolException("The tool call is missing a name")
-        val argumentsText = function["arguments"]?.jsonPrimitive?.contentOrNull ?: "{}"
-        val arguments = runCatching { json.parseToJsonElement(argumentsText).jsonObject }
-            .getOrElse { throw ModelProtocolException("The tool call contains invalid arguments") }
+        val arguments = when (val value = function["arguments"]) {
+            null -> JsonObject(emptyMap())
+            is JsonObject -> value
+            is JsonPrimitive -> value.takeIf(JsonPrimitive::isString)?.contentOrNull?.let { argumentsText ->
+                runCatching { json.parseToJsonElement(argumentsText) as? JsonObject }.getOrNull()
+            } ?: throw ModelProtocolException("The tool call contains invalid arguments")
+            else -> throw ModelProtocolException("The tool call contains invalid arguments")
+        }
         return name to arguments
+    }
+
+    private fun parseToolCallFromContent(message: JsonObject): JsonObject {
+        val content = (message["content"] as? JsonPrimitive)
+            ?.takeIf(JsonPrimitive::isString)
+            ?.contentOrNull
+            ?.trim()
+            ?.takeIf(String::isNotEmpty)
+            ?: throw ModelProtocolException("The model did not return a structured tool call")
+        val parsed = runCatching {
+            json.parseToJsonElement(content.unwrapExactJsonCodeFence()) as? JsonObject
+        }.getOrNull() ?: throw ModelProtocolException("The model did not return a structured tool call")
+        return if (parsed["function"] is JsonObject) {
+            parsed["function"] as JsonObject
+        } else {
+            parsed
+        }
     }
 
     private fun brainRequestContent(request: AgentBrainRequest): JsonElement {
@@ -960,11 +989,6 @@ class OpenAiCompatibleClient(
         includeScreenshot: Boolean,
         onText: (String) -> Unit
     ): AgentUserAnswerStreamResult {
-        if (provider.streamingMode == AgentStreamingMode.DISABLED) {
-            val decision = finishTask(provider, context, includeScreenshot)
-            (decision.action as AgentAction.Finish).summary.let(onText)
-            return AgentUserAnswerStreamResult(decision, provider.streamingMode, usedStreaming = false)
-        }
         validateResolvedProvider(provider, requiresToolCalling = false)
         require(!includeScreenshot || provider.capabilities.vision) { "Provider does not support vision input" }
         val shouldIncludeImage = includeScreenshot && context.observation.screenshotPng != null
@@ -1394,7 +1418,7 @@ class OpenAiCompatibleClient(
             if (requestedMode == AgentStreamingMode.AUTO) 1 else 0
         var attempt = 0
         var retriesUsed = 0
-        var streaming = true
+        var streaming = requestedMode != AgentStreamingMode.DISABLED
         var billing = AgentModelBilling()
 
         while (attempt < maximumAttempts) {
@@ -3218,6 +3242,7 @@ private fun AgentAction.toModelActionArguments(): JsonObject = buildJsonObject {
         is AgentAction.ForceStopPackage -> put("package_name", current.packageName)
         is AgentAction.ClearAppData -> put("package_name", current.packageName)
         is AgentAction.UninstallPackage -> put("package_name", current.packageName)
+        is AgentAction.ExternalApproval -> error("Bridge approvals cannot enter the model action ledger")
     }
     val meta = current.meta
     if (meta.intent.isNotBlank() || meta.target.isNotBlank() || meta.operationKind != AgentOperationKind.NAVIGATION) {

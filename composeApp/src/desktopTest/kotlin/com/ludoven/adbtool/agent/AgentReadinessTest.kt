@@ -11,7 +11,9 @@ class AgentReadinessTest {
             resolveAgentReadiness(
                 deviceConnected = false,
                 configurationChecked = false,
-                modelReady = false
+                modelConfigured = false,
+                executionReady = false,
+                externalEngineSelected = false
             )
         )
     }
@@ -23,7 +25,9 @@ class AgentReadinessTest {
             resolveAgentReadiness(
                 deviceConnected = true,
                 configurationChecked = false,
-                modelReady = false
+                modelConfigured = false,
+                executionReady = false,
+                externalEngineSelected = false
             )
         )
     }
@@ -35,7 +39,37 @@ class AgentReadinessTest {
             resolveAgentReadiness(
                 deviceConnected = true,
                 configurationChecked = true,
-                modelReady = false
+                modelConfigured = false,
+                executionReady = false,
+                externalEngineSelected = false
+            )
+        )
+    }
+
+    @Test
+    fun `configured model requests capability test instead of configuration`() {
+        assertEquals(
+            AgentReadiness.MODEL_TEST_REQUIRED,
+            resolveAgentReadiness(
+                deviceConnected = true,
+                configurationChecked = true,
+                modelConfigured = true,
+                executionReady = false,
+                externalEngineSelected = false
+            )
+        )
+    }
+
+    @Test
+    fun `configured external engine failure is not reported as missing model`() {
+        assertEquals(
+            AgentReadiness.ENGINE_UNAVAILABLE,
+            resolveAgentReadiness(
+                deviceConnected = true,
+                configurationChecked = true,
+                modelConfigured = true,
+                executionReady = false,
+                externalEngineSelected = true
             )
         )
     }
@@ -47,7 +81,9 @@ class AgentReadinessTest {
             resolveAgentReadiness(
                 deviceConnected = true,
                 configurationChecked = true,
-                modelReady = true
+                modelConfigured = true,
+                executionReady = true,
+                externalEngineSelected = false
             )
         )
     }

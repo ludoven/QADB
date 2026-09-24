@@ -16,6 +16,7 @@ import com.ludoven.adbtool.agent.AgentProviderAuthType
 import com.ludoven.adbtool.agent.AgentProviderProfile
 import com.ludoven.adbtool.agent.ResolvedAgentProvider
 import com.ludoven.adbtool.agent.executionGate
+import com.ludoven.adbtool.agent.artemis.ExternalTaskRecord
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
@@ -33,6 +34,15 @@ import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 class AiAgentViewModelTest {
+    @Test
+    fun `unresolved external record blocks only its bound device after restart`() {
+        val record = ExternalTaskRecord("run", "session", "device-a", "flash", "stop_unconfirmed", 1)
+        assertTrue(record.blocksNewDeviceTask("device-a"))
+        assertFalse(record.blocksNewDeviceTask("device-b"))
+        assertFalse(record.copy(status = "stopped").blocksNewDeviceTask("device-a"))
+        assertFalse(record.copy(status = "orphaned_released").blocksNewDeviceTask("device-a"))
+    }
+
     @Test
     fun `preflight rejects explicit device operation before model classification`() {
         val gate = AgentTaskIntentRouter().executionGate("打开微信")
@@ -120,21 +130,27 @@ class AiAgentViewModelTest {
     fun `old run finally cannot clear a newer run after cancellation`() {
         val registry = AgentTaskRunHandleRegistry()
         val baseline = AgentTaskUiState()
-        val runA = registry.begin("run-a", AgentOrchestratorPublicEventAdapter("run-a", baseline), 4L)
+        val runA = registry.begin("run-a", AgentOrchestratorPublicEventAdapter("run-a", baseline), 4L, "device")
         val jobA = Job()
         val confirmationA = CompletableDeferred<Boolean>()
         assertTrue(registry.attachJob(runA, jobA))
-        assertTrue(registry.registerConfirmation(runA, confirmationA))
+        assertTrue(registry.registerConfirmation(runA, "step-a", confirmationA))
 
         val cancelledA = registry.detachActiveForCancellation()
         assertSame(jobA, cancelledA.job)
         assertSame(confirmationA, cancelledA.confirmation)
 
-        val runB = registry.begin("run-b", AgentOrchestratorPublicEventAdapter("run-b", baseline), 6L)
+        val runB = registry.begin("run-b", AgentOrchestratorPublicEventAdapter("run-b", baseline), 6L, "device")
         val jobB = Job()
         val confirmationB = CompletableDeferred<Boolean>()
         assertTrue(registry.attachJob(runB, jobB))
-        assertTrue(registry.registerConfirmation(runB, confirmationB))
+        assertTrue(registry.registerConfirmation(runB, "step-b", confirmationB))
+
+        assertFalse(registry.respondToActiveConfirmation("run-a", "step-a", true))
+        assertFalse(registry.respondToActiveConfirmation("run-b", "step-a", true))
+        assertFalse(confirmationB.isCompleted)
+        assertTrue(registry.respondToActiveConfirmation("run-b", "step-b", false))
+        assertTrue(confirmationB.isCompleted)
 
         assertFalse(registry.finish(runA))
         val cancelledB = registry.detachActiveForCancellation()
@@ -226,7 +242,8 @@ class AiAgentViewModelTest {
         val handle = registry.begin(
             "run",
             AgentOrchestratorPublicEventAdapter("run", baseline),
-            (nowMs - acceptedAtMs).coerceAtLeast(0)
+            (nowMs - acceptedAtMs).coerceAtLeast(0),
+            "device"
         )
 
         nowMs = 1_000L

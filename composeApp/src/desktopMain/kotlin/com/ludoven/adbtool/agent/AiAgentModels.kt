@@ -198,6 +198,9 @@ data class AgentTaskUiState(
     val messages: List<AgentMessage> = emptyList(),
     val steps: List<AgentStep> = emptyList(),
     val isRunning: Boolean = false,
+    val taskMode: AgentTaskMode = AgentTaskMode.EXECUTE,
+    /** One-run consent for read-only device evidence in Ask or Plan. */
+    val deviceEvidenceAuthorized: Boolean = false,
     /** Terminal handoff: execution stopped safely and requires an explicit new user turn to continue. */
     val needsUser: Boolean = false,
     val boundDeviceId: String? = null,
@@ -207,6 +210,9 @@ data class AgentTaskUiState(
     val failure: AgentFailure? = null,
     val phase: AgentRunPhase = AgentRunPhase.IDLE,
     val usage: AgentUsage = AgentUsage(),
+    /** Per-request input usage, when the provider reports it. Cumulative usage is [usage]. */
+    val lastRequestUsage: AgentUsage? = null,
+    val stopOutcome: AgentStopOutcome = AgentStopOutcome.NONE,
     val memoryEnabled: Boolean = false,
     val memoryHitCount: Int = 0,
     val savedMemoryCount: Int = 0,
@@ -222,7 +228,8 @@ data class AgentTaskUiState(
     val benchmarkTaskId: String? = null,
     val semanticActivity: AgentSemanticActivity? = null,
     val v2Metrics: AgentV2RunMetrics = AgentV2RunMetrics(),
-    val publicActivity: AgentPublicActivityState = AgentPublicActivityState()
+    val publicActivity: AgentPublicActivityState = AgentPublicActivityState(),
+    val authorizedPackages: Set<String> = emptySet()
 )
 
 interface AgentTaskRunner {
@@ -238,6 +245,30 @@ interface AgentTaskRunner {
     ): AgentTaskUiState
 }
 
+/**
+ * Optional capability for runners which own an external process.  Cancellation
+ * remains best-effort, but must be scoped to the run supplied by QADB.
+ */
+interface CancellableAgentTaskRunner : AgentTaskRunner {
+    suspend fun cancel(runId: String): Boolean
+}
+
+/** Engine-specific admission check, deliberately separate from model-provider checks. */
+interface AgentTaskRunnerReadiness {
+    suspend fun readiness(): AgentRunnerReadiness
+}
+
+/** Reconciliation is read-only and must never re-submit an external task. */
+interface AgentTaskRunnerRecovery {
+    suspend fun reconcileExternalTasks()
+}
+
+data class AgentRunnerReadiness(
+    val ready: Boolean,
+    val message: String? = null,
+    val selectedEngine: AgentEngineKind = AgentEngineKind.SCREENSHOT
+)
+
 enum class AgentRunPhase {
     IDLE,
     OBSERVING,
@@ -249,6 +280,19 @@ enum class AgentRunPhase {
     COMPLETED,
     FAILED,
     CANCELLED
+}
+
+enum class AgentStopOutcome {
+    NONE,
+    REQUESTED,
+    CONFIRMED,
+    UNCONFIRMED
+}
+
+enum class AgentTaskMode {
+    ASK,
+    PLAN,
+    EXECUTE
 }
 
 enum class AgentExecutionStrategy {
@@ -275,6 +319,7 @@ data class AgentUsage(
 
 enum class AgentObservationMode {
     VISION,
+    SEMANTIC,
     TEXT_ONLY
 }
 
@@ -506,6 +551,20 @@ sealed interface AgentAction {
         override val toolName = "reboot_device"
         override val requiresConfirmation = false
     }
+
+    /** Approval-only metadata from the QADB Bridge. Never dispatch through a device gateway. */
+    data class ExternalApproval(
+        val approvalId: String,
+        val actionKind: String,
+        val actionTarget: String,
+        val deviceId: String,
+        val actionDigest: String,
+        val taskVersion: Int,
+        val expiresInMs: Long
+    ) : AgentAction {
+        override val toolName = "external_approval"
+        override val requiresConfirmation = true
+    }
 }
 
 enum class AgentKey(val androidKeyCode: String) {
@@ -575,6 +634,7 @@ fun validateAgentAction(action: AgentAction, observation: AgentObservation): Res
         is AgentAction.KeyEvent,
         AgentAction.Observe,
         AgentAction.RebootDevice -> Unit
+        is AgentAction.ExternalApproval -> error("External approvals cannot execute through the device gateway")
     }
 }
 

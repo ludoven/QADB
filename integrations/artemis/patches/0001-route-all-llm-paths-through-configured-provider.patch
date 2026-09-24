@@ -1,0 +1,154 @@
+diff --git a/artemis/agents/flash/summarizer.py b/artemis/agents/flash/summarizer.py
+index 56c5e09..8c1ccb1 100644
+--- a/artemis/agents/flash/summarizer.py
++++ b/artemis/agents/flash/summarizer.py
+@@ -36,7 +36,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+ 
+ from artemis.context import ArtemisContext
+ from artemis.memory.step_memory import JobKey, StepMemoryService
+-from artemis.services.llm import RobustChatModelWrapper, get_google_llm, get_llm
++from artemis.services.llm import RobustChatModelWrapper, get_llm
+ from artemis.services.token_meter import record_llm_usage
+ from artemis.utils.logger import get_logger
+ from artemis.utils.task_tree import format_actions_clean
+@@ -161,16 +161,15 @@ class VisualStepSummarizer(StepMemoryService):
+             flush_timeout_s=flush_timeout_s,
+         )
+ 
+-        # Initialize lightweight VLM: prioritize explicit model_name
+-        target_model = model_name or "gemini-2.5-flash-lite"
+-        self._model_name = target_model
++        # The visual lens is a normal agent node. Resolve it through the active
++        # provider routing rather than instantiating a Google-only client from a
++        # model identifier; custom OpenAI-compatible providers such as MiMo use
++        # the same image and tool contract as the rest of the task.
++        self._model_name = model_name or "configured-summarizer"
+         try:
+-            if model_name:
+-                self._llm = get_google_llm(model_name=target_model, temperature=0.0)
+-            else:
+-                self._llm = get_llm(ctx, name="summarizer", is_utils=True)
+-        except Exception:
+-            self._llm = get_google_llm(model_name=target_model, temperature=0.0)
++            self._llm = get_llm(ctx, name="summarizer", temperature=0.0)
++        except Exception as exc:
++            raise RuntimeError("Could not resolve the configured step summarizer model") from exc
+         try:
+             configured = getattr(self._llm, "model", None) or getattr(self._llm, "model_name", None)
+             if isinstance(configured, str) and configured:
+@@ -341,7 +340,7 @@ class VisualStepSummarizer(StepMemoryService):
+         """Meter one raw-model lens call as an ``llm_usage`` trace, best-effort.
+ 
+         Gateway-wrapped models already meter at the wrapper exit; only the raw
+-        ``get_google_llm`` bypass needs explicit metering here. Lens prompts
++        The dedicated lens prompt needs explicit metering here.
+         are tiny and must not overwrite the session's ``last_prompt_tokens``
+         (the compaction thresholds' live context base), hence
+         ``update_last_prompt=False``.
+diff --git a/artemis/config/llm.py b/artemis/config/llm.py
+index 36915dd..6bb670e 100644
+--- a/artemis/config/llm.py
++++ b/artemis/config/llm.py
+@@ -260,6 +260,11 @@ def _expand_default_into_nodes(config_dict: dict) -> dict:
+         "history_analyzer_expert",
+         "diagnoser_expert",
+         "explorer",
++        # These optional nodes otherwise synthesize a Google-only default even
++        # when a unified non-Google default is configured.
++        "validator_pixel_safety_net",
++        "planner_validation",
++        "output_analyzer",
+     ]
+ 
+     all_utils_nodes = [
+diff --git a/artemis/memory/chunking.py b/artemis/memory/chunking.py
+index 4e56454..a9d82a2 100644
+--- a/artemis/memory/chunking.py
++++ b/artemis/memory/chunking.py
+@@ -323,17 +323,15 @@ class StepCapsuleLens(StepLens):
+ 
+     def _get_llm(self):
+         if self._llm is None:
+-            from artemis.services.llm import get_google_llm
+-
+-            self._llm = get_google_llm(model_name=self._model_name, temperature=0.0)
++            raise RuntimeError(
++                "No configured capsule model is available; refusing to select a different provider."
++            )
+         return self._llm
+ 
+     def _get_fallback_llm(self):
+         if self._fallback_llm is None and self._fallback_model_name:
+-            from artemis.services.llm import get_google_llm
+-
+-            self._fallback_llm = get_google_llm(
+-                model_name=self._fallback_model_name, temperature=0.0
++            raise RuntimeError(
++                "No configured capsule fallback model is available; refusing to select a different provider."
+             )
+         return self._fallback_llm
+ 
+@@ -942,10 +940,28 @@ class HistoryChunkManager:
+                 f"Memory runtime config unavailable; using capsule service defaults: {exc}",
+                 exc_info=True,
+             )
++        primary_llm = None
++        fallback_llm = None
++        if ctx is not None:
++            try:
++                from artemis.services.llm import get_llm
++
++                primary_llm = get_llm(ctx, name="summarizer", temperature=0.0)
++                fallback_llm = get_llm(
++                    ctx, name="summarizer", use_fallback=True, temperature=0.0
++                )
++            except Exception as exc:
++                logger.warning(
++                    "Could not resolve the configured capsule model; capsule compression will "
++                    "remain unavailable instead of switching providers: %s",
++                    exc,
++                )
+         lens = StepCapsuleLens(
+             self._model_name,
++            llm=primary_llm,
+             ctx=ctx,
+             fallback_model_name=self._resolve_capsule_fallback_model(ctx),
++            fallback_llm=fallback_llm,
+         )
+         return ChunkCapsuleService(ctx, lens, **kwargs)
+ 
+diff --git a/artemis/sdk/agent.py b/artemis/sdk/agent.py
+index a0028eb..eba163f 100644
+--- a/artemis/sdk/agent.py
++++ b/artemis/sdk/agent.py
+@@ -281,6 +281,29 @@ class Agent:
+                 "model_ready", "Model connection is ready (fake LLM)", session_id=self._session_id
+             )
+             return
++        from artemis.config.llm import get_default_llm_config
++
++        llm_config = get_default_llm_config()
++        configured_providers = {
++            str(entry.provider)
++            for entry in (
++                llm_config.planner,
++                llm_config.summarizer,
++                llm_config.operator,
++                llm_config.checker,
++                llm_config.utils.outputter,
++                llm_config.utils.hopper,
++            )
++        }
++        if "google" not in configured_providers:
++            logger.info(
++                "Skipping Gemini connection pre-warming because the active LLM configuration "
++                "does not use a Google provider."
++            )
++            publish_startup_progress(
++                "model_ready", "Model connection will initialize on first use", session_id=self._session_id
++            )
++            return
+         publish_startup_progress(
+             "model_warmup", "Warming the model connection", session_id=self._session_id
+         )
+

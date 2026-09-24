@@ -219,7 +219,9 @@ import com.ludoven.adbtool.agent.AgentModelCatalog
 import com.ludoven.adbtool.agent.AgentApprovalPolicy
 import com.ludoven.adbtool.agent.AgentApprovalRuntime
 import com.ludoven.adbtool.agent.AgentFeatureRuntime
+import com.ludoven.adbtool.agent.ArtemisEngineRuntime
 import com.ludoven.adbtool.agent.VisionMode
+import com.ludoven.adbtool.agent.artemis.ArtemisProfile
 import com.ludoven.adbtool.ui.icons.CompatIconVectors
 import com.ludoven.adbtool.util.l10n
 import com.ludoven.adbtool.ui.mac.AlertDialog
@@ -1677,6 +1679,8 @@ private fun AgentInputHelperSettingsSection(selectedDeviceId: String?) {
 private fun AiModelSettingsSection() {
     val repository = remember { AiConfiguration.repository }
     val providerRepository = remember { AgentProviderRuntime.repository }
+    val artemisPreferences = remember { ArtemisEngineRuntime.preferences }
+    val artemisConfiguration by artemisPreferences.configuration.collectAsState()
     val providerProfiles by providerRepository.profiles.collectAsState()
     val savedConfig by repository.config.collectAsState()
     val hasSavedKey by repository.hasApiKeyState.collectAsState()
@@ -1765,6 +1769,52 @@ private fun AiModelSettingsSection() {
                     showModelDialog = true
                 },
                 primary = !isConfigured
+            )
+        }
+
+        SettingSwitchRow(
+            title = l10n("Artemis 实验引擎", "Experimental Artemis engine"),
+            description = l10n(
+                "启用后仅使用本机 Artemis；未通过就绪检查时阻止发送，不会回退 Screenshot。运行中的任务不受设置变更影响。",
+                "Uses local Artemis exclusively when enabled. Sending is blocked until ready and never falls back to Screenshot. Active tasks are unaffected."
+            ),
+            checked = artemisConfiguration.enabled,
+            onCheckedChange = { enabled ->
+                artemisPreferences.setConfiguration(artemisConfiguration.copy(enabled = enabled))
+            }
+        )
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 16.dp, end = 16.dp, bottom = 10.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = l10n(
+                    "实验配置：${artemisConfiguration.profile.name} · ${artemisConfiguration.baseUrl}",
+                    "Experimental profile: ${artemisConfiguration.profile.name} · ${artemisConfiguration.baseUrl}"
+                ),
+                modifier = Modifier.weight(1f),
+                color = SettingColors.SecondaryText,
+                fontSize = 11.5.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            SettingActionButton(
+                text = if (artemisConfiguration.profile == ArtemisProfile.FLASH) "Flash" else "Pro",
+                icon = CompatIconVectors.Edit,
+                onClick = {
+                    artemisPreferences.setConfiguration(
+                        artemisConfiguration.copy(
+                            profile = if (artemisConfiguration.profile == ArtemisProfile.FLASH) {
+                                ArtemisProfile.PRO
+                            } else {
+                                ArtemisProfile.FLASH
+                            }
+                        )
+                    )
+                }
             )
         }
 
@@ -2324,16 +2374,15 @@ internal fun AiModelConfigDialog(
                                 statusMessage = result.exceptionOrNull()?.message
                                 if (result.isSuccess) {
                                     providerRepository.syncLegacy(currentConfig(), apiKey)
-                                    val report = capabilityReport
-                                    val tier = report?.tier ?: if (currentConfig().visionMode != VisionMode.DISABLED) {
-                                        AgentCapabilityTier.L3_VISUAL_AGENT
-                                    } else {
-                                        AgentCapabilityTier.L2_SEMANTIC_AGENT
+                                    // Declaring vision support is not compatibility evidence.
+                                    // Keep a still-valid attestation for unchanged settings, but
+                                    // only create a new one from an actual capability probe.
+                                    capabilityReport?.let { report ->
+                                        providerRepository.resolve(AgentModelRole.BRAIN)
+                                            ?.let { provider ->
+                                                providerRepository.attestCapabilities(provider.profile, report.tier)
+                                            }
                                     }
-                                    providerRepository.resolve(AgentModelRole.BRAIN)
-                                        ?.let { provider ->
-                                            providerRepository.attestCapabilities(provider.profile, tier)
-                                        }
                                     onSaved()
                                 }
                                 isSaving = false

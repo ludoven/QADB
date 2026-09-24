@@ -134,6 +134,7 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -165,9 +166,12 @@ import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -184,11 +188,12 @@ import com.ludoven.adbtool.agent.AgentFailureCode
 import com.ludoven.adbtool.agent.AgentFailureStage
 import com.ludoven.adbtool.agent.AgentFailureSubsystem
 import com.ludoven.adbtool.agent.AgentFeatureRuntime
+import com.ludoven.adbtool.agent.AgentApprovalRuntime
+import com.ludoven.adbtool.agent.AgentApprovalPolicy
 import com.ludoven.adbtool.agent.AgentMessage
 import com.ludoven.adbtool.agent.AgentMessageRole
 import com.ludoven.adbtool.agent.AgentReadiness
 import com.ludoven.adbtool.agent.resolveAgentReadiness
-import com.ludoven.adbtool.agent.AgentObservationMode
 import com.ludoven.adbtool.agent.AgentPublicActivityItem
 import com.ludoven.adbtool.agent.AgentPublicActivityState
 import com.ludoven.adbtool.agent.AgentPublicMetrics
@@ -199,7 +204,11 @@ import com.ludoven.adbtool.agent.AgentPublicToolResult
 import com.ludoven.adbtool.agent.AgentPublicToolSummary
 import com.ludoven.adbtool.agent.AgentRunPhase
 import com.ludoven.adbtool.agent.AgentRunPresentation
+import com.ludoven.adbtool.agent.AgentSessionHistoryRecord
 import com.ludoven.adbtool.agent.AgentStep
+import com.ludoven.adbtool.agent.AgentTaskMode
+import com.ludoven.adbtool.agent.AgentStopOutcome
+import com.ludoven.adbtool.agent.AgentUsage
 import com.ludoven.adbtool.agent.SCREENSHOT_AGENT_HARD_ACTION_LIMIT
 import com.ludoven.adbtool.entity.DeviceCenterInfoData
 import com.ludoven.adbtool.entity.DeviceInfoData
@@ -211,7 +220,6 @@ import com.ludoven.adbtool.ui.mac.Icon
 import com.ludoven.adbtool.ui.mac.MaterialTheme
 import com.ludoven.adbtool.ui.mac.OutlinedButton
 import com.ludoven.adbtool.ui.mac.Surface
-import com.ludoven.adbtool.ui.mac.Switch
 import com.ludoven.adbtool.ui.mac.Text
 import com.ludoven.adbtool.ui.mac.TextButton
 import com.ludoven.adbtool.viewmodel.AiAgentViewModel
@@ -219,14 +227,13 @@ import com.ludoven.adbtool.viewmodel.DevicesViewModel
 import com.ludoven.adbtool.widget.FramedStateSurface
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.launch
 import org.jetbrains.compose.resources.painterResource
 import org.jetbrains.compose.resources.stringResource
 import org.jetbrains.skia.Image as SkiaImage
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
-
-private const val DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000
 
 /** Phases in which the task actively occupies the agent (used for notifications). */
 private val RUNNING_PHASES = setOf(
@@ -252,6 +259,19 @@ internal fun agentScreenLayout(widthDp: Float): AgentScreenLayout = when {
 
 internal fun agentLatestItemScrollOffset(): Int = 0
 
+internal fun agentContextFillFraction(lastRequestUsage: AgentUsage?, contextWindowTokens: Int?): Float? {
+    val inputTokens = lastRequestUsage?.promptTokens?.takeIf { it > 0 } ?: return null
+    val window = contextWindowTokens?.takeIf { it > 0 } ?: return null
+    return (inputTokens.toFloat() / window).coerceIn(0f, 1f)
+}
+
+internal fun shouldSubmitAgentComposerOnEnter(
+    keyDown: Boolean,
+    enter: Boolean,
+    shiftPressed: Boolean,
+    composingText: Boolean
+): Boolean = keyDown && enter && !shiftPressed && !composingText
+
 internal fun shouldShowAgentGuide(messages: List<AgentMessage>): Boolean =
     messages.none { it.role != AgentMessageRole.SYSTEM }
 
@@ -263,9 +283,14 @@ fun AiAgentScreen(
     onOpenSettings: () -> Unit
 ) {
     val taskState by viewModel.state.collectAsState()
+    val sessionHistory by viewModel.sessionHistory.collectAsState()
+    val externalStopCheckMessage by viewModel.externalStopCheckMessage.collectAsState()
     val modelConfig by viewModel.modelConfig.collectAsState()
     val apiKeyAvailable by viewModel.apiKeyAvailable.collectAsState()
     val configurationReady by viewModel.configurationReady.collectAsState()
+    val advisoryReady by viewModel.advisoryReady.collectAsState()
+    val modelConfigured by viewModel.modelConfigured.collectAsState()
+    val externalEngineSelected by viewModel.externalEngineSelected.collectAsState()
     val configurationChecked by viewModel.configurationChecked.collectAsState()
     val selectedDevice by devicesViewModel.selectedDevice.collectAsState()
     val devices by devicesViewModel.devices.collectAsState()
@@ -275,21 +300,28 @@ fun AiAgentScreen(
     val agentFeaturePreferences = remember { AgentFeatureRuntime.preferences }
     val reduceMotion by agentFeaturePreferences.reduceMotion.collectAsState()
     var prompt by remember { mutableStateOf("") }
+    var selectedMode by remember { mutableStateOf(AgentTaskMode.EXECUTE) }
+    var readDeviceEvidence by remember { mutableStateOf(false) }
+    var continuationParent by remember { mutableStateOf<AgentSessionHistoryRecord?>(null) }
+    var priorOutcomeChecked by remember { mutableStateOf(false) }
+    val approvalPolicy by remember { AgentApprovalRuntime.preferences.policy }.collectAsState()
     var showModelDialog by remember { mutableStateOf(false) }
     var showNewTaskDialog by remember { mutableStateOf(false) }
+    var showHistoryDialog by remember { mutableStateOf(false) }
     var devicePanelCollapsed by remember { mutableStateOf(false) }
-    var obsSwitchOn by remember(taskState.observationMode) {
-        mutableStateOf(taskState.observationMode == AgentObservationMode.VISION)
-    }
+    var showNarrowDevicePanel by remember { mutableStateOf(false) }
     val isConnected = selectedDevice != null && selectedDevice in devices
     val readiness = resolveAgentReadiness(
-        deviceConnected = isConnected,
+        deviceConnected = (selectedMode != AgentTaskMode.EXECUTE && !readDeviceEvidence) || isConnected,
         configurationChecked = configurationChecked,
-        modelReady = configurationReady
+        modelConfigured = if (selectedMode == AgentTaskMode.EXECUTE) modelConfigured else advisoryReady,
+        executionReady = if (selectedMode == AgentTaskMode.EXECUTE) configurationReady else advisoryReady,
+        externalEngineSelected = selectedMode == AgentTaskMode.EXECUTE && externalEngineSelected
     )
-    val contextWindowTokens = modelConfig.contextWindowTokens ?: DEFAULT_CONTEXT_WINDOW_TOKENS
+    val contextWindowTokens = modelConfig.contextWindowTokens.takeUnless { externalEngineSelected }
 
-    val canSend = prompt.isNotBlank() && !taskState.isRunning && readiness == AgentReadiness.READY
+    val canSend = prompt.isNotBlank() && !taskState.isRunning && readiness == AgentReadiness.READY &&
+        (continuationParent == null || priorOutcomeChecked)
     val recognizePrompt = stringResource(Res.string.agent_prompt_recognize)
 
     LaunchedEffect(Unit) {
@@ -322,7 +354,7 @@ fun AiAgentScreen(
                         AgentRunPhase.COMPLETED -> if (!focused) {
                             DesktopNotifier.notify(
                                 caption = "QADB · AI Agent",
-                                message = l10n("任务已完成", "Task completed")
+                                message = l10n("任务已结束，请核对设备结果", "Task ended; check the device outcome")
                             )
                         }
                         AgentRunPhase.FAILED -> if (!focused) {
@@ -349,7 +381,15 @@ fun AiAgentScreen(
                 return
             }
             AgentReadiness.MODEL_REQUIRED -> {
-                showModelDialog = true
+                if (selectedMode == AgentTaskMode.EXECUTE) showModelDialog = true else onOpenSettings()
+                return
+            }
+            AgentReadiness.MODEL_TEST_REQUIRED -> {
+                if (selectedMode == AgentTaskMode.EXECUTE) showModelDialog = true else onOpenSettings()
+                return
+            }
+            AgentReadiness.ENGINE_UNAVAILABLE -> {
+                onOpenSettings()
                 return
             }
             AgentReadiness.CHECKING -> return
@@ -357,9 +397,12 @@ fun AiAgentScreen(
         }
         // startTask rejects the prompt with an inline error when no device is
         // selected; only clear the input when the task can actually be handed off.
-        viewModel.startTask(trimmed, selectedDevice)
-        if (isConnected) {
+        if (viewModel.startTask(trimmed, selectedDevice, selectedMode, continuationParent?.runId,
+                priorOutcomeChecked = priorOutcomeChecked, readDeviceEvidence = readDeviceEvidence)) {
             prompt = ""
+            continuationParent = null
+            priorOutcomeChecked = false
+            readDeviceEvidence = false
         }
     }
 
@@ -390,6 +433,43 @@ fun AiAgentScreen(
             running = taskState.isRunning
         )
 
+        if (taskState.stopOutcome == AgentStopOutcome.UNCONFIRMED) {
+            Row(
+                modifier = Modifier.fillMaxWidth().background(QadbTokens.warningContainer).padding(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = externalStopCheckMessage
+                        ?.takeIf { it.first == taskState.publicActivity.activeRunId }?.second
+                        ?: l10n("远端停止未确认；此设备暂不能启动新任务。", "Remote stop is unconfirmed; this device remains blocked."),
+                    color = QadbTokens.warningText,
+                    modifier = Modifier.weight(1f)
+                )
+                taskState.publicActivity.activeRunId?.let { runId ->
+                    Row {
+                        TextButton(onClick = { viewModel.recheckExternalStop(runId) }) {
+                            Text(l10n("重新核查", "Recheck"))
+                        }
+                        TextButton(onClick = { viewModel.forceReleaseExternalBlock(runId) }) {
+                            Text(l10n("强制解除", "Force Release"))
+                        }
+                    }
+                }
+            }
+        } else if (taskState.stopOutcome == AgentStopOutcome.REQUESTED) {
+            Text(
+                text = l10n("停止请求已发出，正在等待执行器确认…", "Stop requested; waiting for the runner…"),
+                color = QadbTokens.infoText,
+                modifier = Modifier.fillMaxWidth().background(QadbTokens.infoContainer).padding(12.dp)
+            )
+        } else if (taskState.phase == AgentRunPhase.COMPLETED) {
+            Text(
+                text = if (taskState.needsUser) l10n("任务需要你接管；继续前须重新观察设备。", "Task needs your help; capture a fresh observation before continuing.") else l10n("执行已结束；请在设备上核对最终效果。", "Execution ended; check the final outcome on the device."),
+                color = QadbTokens.textSecondary,
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 8.dp)
+            )
+        }
+
         BoxWithConstraints(
             modifier = Modifier
                 .weight(1f)
@@ -400,6 +480,8 @@ fun AiAgentScreen(
             LaunchedEffect(layout) {
                 if (layout == AgentScreenLayout.SINGLE_COLUMN) {
                     devicePanelCollapsed = false
+                } else {
+                    showNarrowDevicePanel = false
                 }
             }
 
@@ -412,62 +494,119 @@ fun AiAgentScreen(
                 ) {
                     AgentConversation(
                         messages = taskState.messages,
+                        selectedMode = selectedMode,
                         readiness = readiness,
                         errorMessage = taskState.errorMessage,
                         publicActivity = taskState.publicActivity,
                         pendingConfirmation = taskState.pendingConfirmation,
+                        boundDeviceId = taskState.boundDeviceId,
                         reduceMotion = reduceMotion,
                         onRetry = ::submit,
-                        onOpenSettings = { showModelDialog = true },
+                        onOpenSettings = {
+                            if (selectedMode != AgentTaskMode.EXECUTE || externalEngineSelected) onOpenSettings() else showModelDialog = true
+                        },
                         onOpenDevices = onOpenDevices,
                         canSubmitQuickPrompt = { !taskState.isRunning },
                         onQuickPrompt = ::handleQuickPrompt,
-                        onConfirmApprove = { viewModel.respondToConfirmation(true) },
-                        onConfirmReject = { viewModel.respondToConfirmation(false) },
+                        onConfirmApprove = { stepId ->
+                            viewModel.respondToConfirmation(taskState.publicActivity.activeRunId.orEmpty(), stepId, true)
+                        },
+                        onConfirmReject = { stepId ->
+                            viewModel.respondToConfirmation(taskState.publicActivity.activeRunId.orEmpty(), stepId, false)
+                        },
+                        onConfirmStop = viewModel::cancelTask,
                         modifier = Modifier.weight(1f)
                     )
 
+                    continuationParent?.let { parent ->
+                        Row(
+                            modifier = Modifier.widthIn(max = 760.dp).fillMaxWidth()
+                                .padding(horizontal = 24.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                l10n("新执行段 · 原设备：${parent.deviceId}。先核对上段效果，再描述下一步；旧动作不会重放。", "New segment · Device: ${parent.deviceId}. Check the prior outcome, then describe the next step. Old actions are not replayed."),
+                                color = QadbTokens.textSecondary,
+                                fontSize = 12.sp,
+                                modifier = Modifier.weight(1f)
+                            )
+                            TextButton(onClick = {
+                                continuationParent = null
+                                priorOutcomeChecked = false
+                            }) {
+                                Text(l10n("取消继续", "Cancel continuation"))
+                            }
+                        }
+                        if (!priorOutcomeChecked) {
+                            TextButton(onClick = { priorOutcomeChecked = true }) {
+                                Text(l10n("我已在设备上核对上段效果", "I checked the previous outcome on the device"))
+                            }
+                        }
+                    }
                     AgentComposer(
                         prompt = prompt,
                         onPromptChange = { prompt = it },
+                        selectedMode = selectedMode,
+                        hasPriorTask = taskState.messages.any { it.role == AgentMessageRole.USER },
+                        linkedContinuation = continuationParent != null,
+                        onModeChange = {
+                            selectedMode = it
+                            if (it != AgentTaskMode.EXECUTE) {
+                                continuationParent = null
+                                priorOutcomeChecked = false
+                            } else {
+                                readDeviceEvidence = false
+                            }
+                        },
+                        approvalPolicy = approvalPolicy,
+                        readDeviceEvidence = readDeviceEvidence,
+                        onReadDeviceEvidenceChange = { readDeviceEvidence = it },
                         canSend = canSend,
                         running = taskState.isRunning,
                         readiness = readiness,
-                        observationMode = taskState.observationMode,
+                        modelConfigured = if (selectedMode == AgentTaskMode.EXECUTE) modelConfigured else advisoryReady,
+                        externalEngineSelected = selectedMode == AgentTaskMode.EXECUTE && externalEngineSelected,
+                        authorizedPackages = taskState.authorizedPackages,
                         totalTokens = taskState.usage.totalTokens,
-                        compactionCount = taskState.compactionCount,
-                        reduceMotion = reduceMotion,
-                        lastObservedAtMs = taskState.deviceState?.capturedAt,
-                        obsSwitchOn = obsSwitchOn,
-                        onObsSwitchChange = { obsSwitchOn = it },
                         onSend = { submit(prompt) },
                         onNewTask = {
                             if (taskState.messages.any { it.role != AgentMessageRole.SYSTEM }) {
                                 showNewTaskDialog = true
                             } else {
                                 viewModel.newTask()
+                                continuationParent = null
+                                priorOutcomeChecked = false
                             }
                         },
                         onCancel = viewModel::cancelTask,
-                        onOpenSettings = { showModelDialog = true },
+                        onHistory = {
+                            viewModel.refreshSessionHistory()
+                            showHistoryDialog = true
+                        },
+                        onOpenSettings = {
+                            if (selectedMode != AgentTaskMode.EXECUTE || externalEngineSelected) onOpenSettings() else showModelDialog = true
+                        },
+                        onOpenEngineSettings = onOpenSettings,
                         onOpenDevices = onOpenDevices,
-                        onQuickRecognize = { submit(recognizePrompt) }
+                        onQuickRecognize = {
+                            selectedMode = AgentTaskMode.EXECUTE
+                            prompt = recognizePrompt
+                        }
                     )
                 }
 
                 if (layout == AgentScreenLayout.PERMANENT_DEVICE_PANEL && !devicePanelCollapsed) {
                     DevicePreviewPanel(
-                        observationMode = taskState.observationMode,
                         screenshot = taskState.latestScreenshot,
                         pageSignature = taskState.deviceState?.pageSignature?.value,
                         pageChanged = taskState.pageDiff?.changed,
                         totalTokens = taskState.usage.totalTokens,
+                        lastRequestUsage = taskState.lastRequestUsage,
                         contextWindowTokens = contextWindowTokens,
                         compactionCount = taskState.compactionCount,
                         lastObservedAtMs = taskState.deviceState?.capturedAt,
                         reduceMotion = reduceMotion,
-                        obsSwitchOn = obsSwitchOn,
-                        onObsSwitchChange = { obsSwitchOn = it },
+                        running = taskState.isRunning,
                         onCollapse = { devicePanelCollapsed = true },
                         modifier = Modifier
                             .width(panelWidth)
@@ -487,19 +626,57 @@ fun AiAgentScreen(
                     color = QadbTokens.bg1
                 ) {
                     DevicePreviewPanel(
-                        observationMode = taskState.observationMode,
                         screenshot = taskState.latestScreenshot,
                         pageSignature = taskState.deviceState?.pageSignature?.value,
                         pageChanged = taskState.pageDiff?.changed,
                         totalTokens = taskState.usage.totalTokens,
+                        lastRequestUsage = taskState.lastRequestUsage,
                         contextWindowTokens = contextWindowTokens,
                         compactionCount = taskState.compactionCount,
                         lastObservedAtMs = taskState.deviceState?.capturedAt,
                         reduceMotion = reduceMotion,
-                        obsSwitchOn = obsSwitchOn,
-                        onObsSwitchChange = { obsSwitchOn = it },
+                        running = taskState.isRunning,
                         onCollapse = { devicePanelCollapsed = true },
                         modifier = Modifier.fillMaxSize()
+                    )
+                }
+            }
+
+            if (layout == AgentScreenLayout.SINGLE_COLUMN && showNarrowDevicePanel) {
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = QadbTokens.bg1
+                ) {
+                    DevicePreviewPanel(
+                        screenshot = taskState.latestScreenshot,
+                        pageSignature = taskState.deviceState?.pageSignature?.value,
+                        pageChanged = taskState.pageDiff?.changed,
+                        totalTokens = taskState.usage.totalTokens,
+                        lastRequestUsage = taskState.lastRequestUsage,
+                        contextWindowTokens = contextWindowTokens,
+                        compactionCount = taskState.compactionCount,
+                        lastObservedAtMs = taskState.deviceState?.capturedAt,
+                        reduceMotion = reduceMotion,
+                        running = taskState.isRunning,
+                        onCollapse = { showNarrowDevicePanel = false },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
+            }
+
+            if (layout == AgentScreenLayout.SINGLE_COLUMN && !showNarrowDevicePanel) {
+                Surface(
+                    onClick = { showNarrowDevicePanel = true },
+                    modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp)
+                        .semantics { contentDescription = l10n("查看设备画面与证据", "View device frame and evidence") },
+                    shape = RoundedCornerShape(UiTokens.RadiusSmall),
+                    color = QadbTokens.bg2,
+                    border = BorderStroke(1.dp, QadbTokens.border)
+                ) {
+                    Text(
+                        l10n("设备画面", "Device"),
+                        color = QadbTokens.textPrimary,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
                     )
                 }
             }
@@ -564,8 +741,8 @@ fun AiAgentScreen(
             text = {
                 Text(
                     text = l10n(
-                        "当前对话与运行记录将被清空，且无法恢复。",
-                        "The current conversation and run history will be cleared. This cannot be undone."
+                        "当前对话会清空；已保存的任务历史仍可查看。",
+                        "The current conversation will be cleared. Saved task history remains available."
                     ),
                     style = TextStyle(fontSize = 13.sp, lineHeight = 20.sp)
                 )
@@ -574,6 +751,8 @@ fun AiAgentScreen(
                 TextButton(onClick = {
                     showNewTaskDialog = false
                     viewModel.newTask()
+                    continuationParent = null
+                    priorOutcomeChecked = false
                 }) {
                     Text(l10n("清空并开始", "Clear and start"), color = QadbTokens.danger)
                 }
@@ -585,6 +764,206 @@ fun AiAgentScreen(
             }
         )
     }
+    if (showHistoryDialog) {
+        AgentHistoryDialog(
+            records = sessionHistory,
+            checkMessage = externalStopCheckMessage,
+            onRecheck = viewModel::recheckExternalStop,
+            onForceRelease = viewModel::forceReleaseExternalBlock,
+            onDelete = viewModel::deleteSessionHistory,
+            onContinue = { record ->
+                viewModel.newTask()
+                continuationParent = record
+                priorOutcomeChecked = false
+                selectedMode = AgentTaskMode.EXECUTE
+                prompt = ""
+                showHistoryDialog = false
+            },
+            canContinue = !taskState.isRunning,
+            onDismiss = { showHistoryDialog = false }
+        )
+    }
+}
+
+@Composable
+private fun AgentHistoryDialog(
+    records: List<AgentSessionHistoryRecord>,
+    checkMessage: Pair<String, String>?,
+    onRecheck: (String) -> Unit,
+    onForceRelease: (String) -> Unit = {},
+    onDelete: suspend (String) -> Boolean,
+    onContinue: (AgentSessionHistoryRecord) -> Unit,
+    canContinue: Boolean,
+    onDismiss: () -> Unit
+) {
+    var search by remember { mutableStateOf("") }
+    var selectedRunId by remember { mutableStateOf<String?>(null) }
+    var deleteRunId by remember { mutableStateOf<String?>(null) }
+    var deleteMessage by remember { mutableStateOf<String?>(null) }
+    val coroutineScope = rememberCoroutineScope()
+    val selected = records.firstOrNull { it.runId == selectedRunId }
+    val filtered = remember(records, search) {
+        records.filter {
+            search.isBlank() || it.title.contains(search, ignoreCase = true) ||
+                it.deviceId.contains(search, ignoreCase = true)
+        }
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (selected != null) {
+                    TextButton(onClick = { selectedRunId = null }) { Text(l10n("返回", "Back")) }
+                }
+                Text(l10n("任务历史", "Task history"), fontWeight = FontWeight.SemiBold)
+            }
+        },
+        text = {
+            Column(modifier = Modifier.widthIn(max = 620.dp).heightIn(max = 480.dp)) {
+                if (selected == null) {
+                    BasicTextField(
+                        value = search,
+                        onValueChange = { search = it },
+                        singleLine = true,
+                        textStyle = TextStyle(color = QadbTokens.textPrimary, fontSize = 14.sp),
+                        modifier = Modifier.fillMaxWidth()
+                            .border(1.dp, QadbTokens.border, RoundedCornerShape(UiTokens.RadiusSmall))
+                            .padding(10.dp),
+                        decorationBox = { inner ->
+                            Box {
+                                if (search.isEmpty()) Text(
+                                    l10n("搜索标题或设备", "Search title or device"),
+                                    color = QadbTokens.textSecondary,
+                                    fontSize = 14.sp
+                                )
+                                inner()
+                            }
+                        }
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        items(filtered, key = { it.runId }) { record ->
+                            Surface(
+                                onClick = { selectedRunId = record.runId },
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(UiTokens.RadiusSmall),
+                                color = QadbTokens.bg2
+                            ) {
+                                Column(Modifier.padding(10.dp)) {
+                                    Text(record.title, color = QadbTokens.textPrimary, maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
+                                    Text(
+                                        "${formatClockTime(record.startedAtMs)} · ${record.deviceId.ifBlank { l10n("未访问设备", "No device access") }} · ${historyStatusLabel(record)}",
+                                        color = QadbTokens.textSecondary, fontSize = 12.sp
+                                    )
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    Text(selected.title, color = QadbTokens.textPrimary, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "${selected.deviceId.ifBlank { l10n("未访问设备", "No device access") }} · ${historyStatusLabel(selected)}",
+                        color = QadbTokens.textSecondary, fontSize = 12.sp
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    LazyColumn(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        items(selected.activities, key = { it.sequence }) { activity ->
+                            val label = activity.tool?.let { publicToolLabel(it) }
+                                ?: publicStageLabel(activity.stage)
+                            Text(
+                                "${formatClockTime(activity.occurredAtMs)} · $label" +
+                                    (activity.result?.let { " · ${publicToolResultLabel(it)}" } ?: ""),
+                                color = QadbTokens.textSecondary, fontSize = 12.sp
+                            )
+                        }
+                    }
+                    Text(
+                        l10n("仅展示公开活动摘要；查看历史不会恢复设备操作。", "Public activity only; viewing history never resumes device actions."),
+                        color = QadbTokens.textSecondary, fontSize = 11.sp
+                    )
+                    selected.parentRunId?.let {
+                        Text(l10n("关联上一个执行段", "Linked to a previous segment"),
+                            color = QadbTokens.textSecondary, fontSize = 11.sp)
+                    }
+                    if (canContinue && selected.finishedAtMs != null && selected.deviceId.isNotBlank() &&
+                        selected.phase in setOf(AgentRunPhase.COMPLETED, AgentRunPhase.FAILED, AgentRunPhase.CANCELLED) &&
+                        selected.stopOutcome != AgentStopOutcome.UNCONFIRMED &&
+                        selected.stopOutcome != AgentStopOutcome.REQUESTED
+                    ) {
+                        TextButton(onClick = { onContinue(selected) }) {
+                            Text(l10n("创建新执行段", "Create new segment"))
+                        }
+                    }
+                    if (selected.stopOutcome == AgentStopOutcome.UNCONFIRMED) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            TextButton(onClick = { onRecheck(selected.runId) }) {
+                                Text(l10n("重新核查所属会话与执行器", "Recheck owned session and worker"))
+                            }
+                            TextButton(onClick = { onForceRelease(selected.runId) }) {
+                                Text(l10n("强制解除占用", "Force release device"))
+                            }
+                        }
+                        checkMessage?.takeIf { it.first == selected.runId }?.let {
+                            Text(it.second, color = QadbTokens.warningText, fontSize = 12.sp)
+                        }
+                    }
+                    if (canContinue && selected.finishedAtMs != null &&
+                        selected.phase in setOf(AgentRunPhase.COMPLETED, AgentRunPhase.FAILED, AgentRunPhase.CANCELLED) &&
+                        selected.stopOutcome in setOf(AgentStopOutcome.NONE, AgentStopOutcome.CONFIRMED) &&
+                        records.none { it.parentRunId == selected.runId }
+                    ) {
+                        TextButton(onClick = { deleteRunId = selected.runId }) {
+                            Text(l10n("删除这条历史", "Delete this history record"))
+                        }
+                    }
+                    deleteMessage?.let { Text(it, color = QadbTokens.warningText, fontSize = 12.sp) }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text(l10n("关闭", "Close")) } }
+    )
+    if (deleteRunId != null) {
+        AlertDialog(
+            onDismissRequest = { deleteRunId = null },
+            title = { Text(l10n("删除任务历史", "Delete task history")) },
+            text = { Text(l10n(
+                "只删除这条历史的标题和公开活动摘要。独立审计日志与指标仍保留；历史未保存截图。此操作不可撤销。",
+                "Only this history title and public activity summary will be deleted. Separate audit logs and metrics remain; history stores no screenshots. This cannot be undone."
+            )) },
+            confirmButton = {
+                TextButton(onClick = {
+                    val runId = deleteRunId ?: return@TextButton
+                    deleteRunId = null
+                    coroutineScope.launch {
+                        if (onDelete(runId)) {
+                            selectedRunId = null
+                            deleteMessage = null
+                        } else {
+                            deleteMessage = l10n(
+                                "这条历史仍在运行、停止未确认或被后续执行段引用，未删除。",
+                                "This record is active, has an unconfirmed stop, or is linked by a later segment. It was not deleted."
+                            )
+                        }
+                    }
+                }) { Text(l10n("删除", "Delete")) }
+            },
+            dismissButton = {
+                TextButton(onClick = { deleteRunId = null }) { Text(l10n("取消", "Cancel")) }
+            }
+        )
+    }
+}
+
+@Composable
+private fun historyStatusLabel(record: AgentSessionHistoryRecord): String = when {
+    record.stopOutcome == AgentStopOutcome.UNCONFIRMED -> l10n("远端停止未确认", "Remote stop unconfirmed")
+    record.finishedAtMs == null -> l10n("运行中断，未自动继续", "Interrupted; not resumed")
+    record.needsUser -> l10n("需要接管", "Needs user")
+    record.phase == AgentRunPhase.COMPLETED -> l10n("结果待核实", "Outcome unverified")
+    record.phase == AgentRunPhase.CANCELLED -> l10n("已停止", "Stopped")
+    record.phase == AgentRunPhase.FAILED -> l10n("失败", "Failed")
+    else -> l10n("状态待核实", "Status unverified")
 }
 
 private fun devicePanelWidth(widthDp: Float): Dp =
@@ -749,18 +1128,21 @@ private fun TopBarDivider() {
 @Composable
 private fun AgentConversation(
     messages: List<AgentMessage>,
+    selectedMode: AgentTaskMode,
     readiness: AgentReadiness,
     errorMessage: String?,
     publicActivity: AgentPublicActivityState,
     pendingConfirmation: AgentStep?,
+    boundDeviceId: String?,
     reduceMotion: Boolean,
     onRetry: (String) -> Unit,
     onOpenSettings: () -> Unit,
     onOpenDevices: () -> Unit,
     canSubmitQuickPrompt: (String) -> Boolean,
     onQuickPrompt: (String) -> Unit,
-    onConfirmApprove: () -> Unit,
-    onConfirmReject: () -> Unit,
+    onConfirmApprove: (String) -> Unit,
+    onConfirmReject: (String) -> Unit,
+    onConfirmStop: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val listState = rememberLazyListState()
@@ -850,6 +1232,7 @@ private fun AgentConversation(
                         contentAlignment = Alignment.Center
                     ) {
                         AgentGuideHero(
+                            selectedMode = selectedMode,
                             readiness = readiness,
                             canSubmit = canSubmitQuickPrompt,
                             onPrompt = onQuickPrompt,
@@ -904,8 +1287,10 @@ private fun AgentConversation(
                     ) {
                         AgentInlineConfirmationCard(
                             step = item.step,
-                            onApprove = onConfirmApprove,
-                            onReject = onConfirmReject,
+                            boundDeviceId = boundDeviceId,
+                            onApprove = { onConfirmApprove(item.step.id) },
+                            onReject = { onConfirmReject(item.step.id) },
+                            onStop = onConfirmStop,
                             modifier = Modifier
                                 .widthIn(max = 720.dp)
                                 .fillMaxWidth()
@@ -1117,19 +1502,13 @@ private fun AgentGuideHeroIcon() {
 
 @Composable
 private fun AgentGuideHero(
+    selectedMode: AgentTaskMode,
     readiness: AgentReadiness,
     canSubmit: (String) -> Boolean,
     onPrompt: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val quickScenarios = listOf(
-        ScenarioCardSpec(
-            title = l10n("系统深度体检", "Deep Diagnostics"),
-            desc = l10n("全面检测电池、内存、系统属性与网络", "Inspect battery, RAM, Android OS & network"),
-            prompt = l10n("请帮我全面检测当前连接设备的状态，包括电池、内存、系统版本和网络属性", "Please check device status including battery, memory, OS version and network"),
-            icon = IconParkIcons.Speed,
-            accentColor = QadbTokens.brand
-        ),
         ScenarioCardSpec(
             title = l10n("屏幕视觉速识", "Screen Vision"),
             desc = l10n("截屏并识别当前画面的文字与控件节点", "Capture screen & recognize text and UI elements"),
@@ -1143,13 +1522,6 @@ private fun AgentGuideHero(
             prompt = stringResource(Res.string.agent_prompt_settings),
             icon = IconParkIcons.Setting,
             accentColor = QadbTokens.success
-        ),
-        ScenarioCardSpec(
-            title = l10n("应用排查诊断", "App Inspection"),
-            desc = l10n("列出已安装第三方包并分析运行状态", "List third-party packages & analyze running apps"),
-            prompt = l10n("请列出当前设备上安装的第三方应用并分析正在运行的应用", "Please list installed third-party apps and inspect running processes"),
-            icon = IconParkIcons.Application,
-            accentColor = QadbTokens.warning
         )
     )
 
@@ -1173,25 +1545,29 @@ private fun AgentGuideHero(
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 Text(
-                    text = l10n("QADB 智能设备助理", "QADB AI Agent Assistant"),
+                    text = if (selectedMode == AgentTaskMode.EXECUTE) l10n("你想让这台设备完成什么？", "What should this device do?")
+                        else l10n("你想了解或规划什么？", "What would you like to ask or plan?"),
                     fontWeight = FontWeight.Bold,
                     fontSize = 17.sp,
                     color = QadbTokens.textPrimary
                 )
                 Text(
-                    text = l10n(
-                        "基于多模态大模型与 Android 视觉/无障碍感知，全自动执行设备操作与系统诊断",
-                        "Autonomous device operation & debugging assistant powered by LLM and UI vision/accessibility"
+                    text = if (selectedMode == AgentTaskMode.EXECUTE) l10n(
+                        "根据当前设备画面逐步操作；敏感动作需要确认。",
+                        "Works step by step from the current screen; sensitive actions need approval."
+                    ) else l10n(
+                        "仅使用你的输入文本，不读取或操作设备。",
+                        "Uses only your text; does not read or operate the device."
                     ),
                     color = QadbTokens.textSecondary,
                     fontSize = 12.5.sp
                 )
             }
 
-            AgentOnboardingSteps(readiness = readiness)
+            if (selectedMode == AgentTaskMode.EXECUTE) AgentOnboardingSteps(readiness = readiness)
 
-            // 2x2 Grid of Scenario Prompt Cards
-            Column(
+            // Examples are limited to capabilities the screenshot engine can currently perform.
+            if (selectedMode == AgentTaskMode.EXECUTE) Column(
                 modifier = Modifier.fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
@@ -1212,23 +1588,6 @@ private fun AgentGuideHero(
                         modifier = Modifier.weight(1f)
                     )
                 }
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    ScenarioCardItem(
-                        spec = quickScenarios[2],
-                        enabled = canSubmit(quickScenarios[2].prompt),
-                        onClick = { onPrompt(quickScenarios[2].prompt) },
-                        modifier = Modifier.weight(1f)
-                    )
-                    ScenarioCardItem(
-                        spec = quickScenarios[3],
-                        enabled = canSubmit(quickScenarios[3].prompt),
-                        onClick = { onPrompt(quickScenarios[3].prompt) },
-                        modifier = Modifier.weight(1f)
-                    )
-                }
             }
         }
     }
@@ -1245,6 +1604,8 @@ private fun AgentOnboardingSteps(readiness: AgentReadiness) {
     val activeStep = when (readiness) {
         AgentReadiness.DEVICE_REQUIRED -> 0
         AgentReadiness.MODEL_REQUIRED -> 1
+        AgentReadiness.MODEL_TEST_REQUIRED,
+        AgentReadiness.ENGINE_UNAVAILABLE,
         AgentReadiness.CHECKING -> 2
         AgentReadiness.READY -> 3
     }
@@ -1985,8 +2346,10 @@ private fun AgentRunFailureCard(
 @Composable
 private fun AgentInlineConfirmationCard(
     step: AgentStep,
+    boundDeviceId: String?,
     onApprove: () -> Unit,
     onReject: () -> Unit,
+    onStop: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val actionName = actionDisplayName(step.action)
@@ -2001,7 +2364,18 @@ private fun AgentInlineConfirmationCard(
     ) {
         stringResource(Res.string.agent_confirm_send)
     } else {
-        stringResource(Res.string.agent_confirm_execute)
+        l10n("允许一次", "Allow once")
+    }
+    val impact = when (val action = step.action) {
+        is AgentAction.ClearAppData -> l10n("将清除 ${action.packageName} 的应用数据。", "Will clear app data for ${action.packageName}.")
+        is AgentAction.UninstallPackage -> l10n("将卸载 ${action.packageName}。", "Will uninstall ${action.packageName}.")
+        is AgentAction.ExternalApproval -> when (action.actionKind) {
+            "manage_app_clear", "manage_app_clear_data" -> l10n("将清除目标应用数据。", "Will clear data for the target app.")
+            "manage_app_uninstall" -> l10n("将卸载目标应用。", "Will uninstall the target app.")
+            "manage_app_stop", "manage_app_force_stop" -> l10n("将停止目标应用。", "Will stop the target app.")
+            else -> l10n("将执行所示设备操作。", "Will perform the shown device action.")
+        }
+        else -> l10n("将执行所示设备操作。", "Will perform the shown device action.")
     }
     Surface(
         modifier = modifier
@@ -2039,6 +2413,25 @@ private fun AgentInlineConfirmationCard(
                 color = QadbTokens.dangerText,
                 style = MaterialTheme.typography.body1.copy(fontSize = 13.sp, lineHeight = 20.sp)
             )
+            Text(
+                text = if (step.action is AgentAction.ExternalApproval) {
+                    l10n("影响：$impact", "Impact: $impact")
+                } else {
+                    l10n("设备：${boundDeviceId ?: "未知"} · 影响：$impact", "Device: ${boundDeviceId ?: "Unknown"} · Impact: $impact")
+                },
+                color = QadbTokens.dangerText,
+                style = MaterialTheme.typography.body2.copy(fontSize = 12.sp, lineHeight = 18.sp)
+            )
+            (step.action as? AgentAction.ExternalApproval)?.let { approval ->
+                Text(
+                    text = l10n(
+                        "设备：${approval.deviceId} · 目标：${approval.actionTarget}\n仅本次动作有效 · 版本 ${approval.taskVersion} · 绑定 ${approval.actionDigest.take(12)}… · 显示时剩余约 ${approval.expiresInMs / 1000} 秒，允许时重新检查",
+                        "Device: ${approval.deviceId} · Target: ${approval.actionTarget}\nOne use only · version ${approval.taskVersion} · binding ${approval.actionDigest.take(12)}… · about ${approval.expiresInMs / 1000}s left when shown; checked again on approval"
+                    ),
+                    color = QadbTokens.dangerText,
+                    style = MaterialTheme.typography.body2.copy(fontSize = 12.sp, lineHeight = 18.sp)
+                )
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 AgentActionButton(
                     label = confirmLabel,
@@ -2053,6 +2446,13 @@ private fun AgentInlineConfirmationCard(
                     borderColor = QadbTokens.border,
                     onClick = onReject
                 )
+                AgentActionButton(
+                    label = l10n("停止任务", "Stop task"),
+                    containerColor = QadbTokens.bg1,
+                    contentColor = QadbTokens.dangerText,
+                    borderColor = QadbTokens.danger,
+                    onClick = onStop
+                )
             }
         }
     }
@@ -2064,25 +2464,37 @@ private fun AgentInlineConfirmationCard(
 private fun AgentComposer(
     prompt: String,
     onPromptChange: (String) -> Unit,
+    selectedMode: AgentTaskMode,
+    hasPriorTask: Boolean,
+    linkedContinuation: Boolean,
+    onModeChange: (AgentTaskMode) -> Unit,
+    approvalPolicy: AgentApprovalPolicy,
+    readDeviceEvidence: Boolean,
+    onReadDeviceEvidenceChange: (Boolean) -> Unit,
     canSend: Boolean,
     running: Boolean,
     readiness: AgentReadiness,
-    observationMode: AgentObservationMode,
+    modelConfigured: Boolean,
+    externalEngineSelected: Boolean,
+    authorizedPackages: Set<String> = emptySet(),
     totalTokens: Int,
-    compactionCount: Int,
-    reduceMotion: Boolean,
-    lastObservedAtMs: Long?,
-    obsSwitchOn: Boolean,
-    onObsSwitchChange: (Boolean) -> Unit,
     onSend: () -> Unit,
     onNewTask: () -> Unit,
     onCancel: () -> Unit,
+    onHistory: () -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenEngineSettings: () -> Unit,
     onOpenDevices: () -> Unit,
     onQuickRecognize: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     var focused by remember { mutableStateOf(false) }
+    var textFieldValue by remember { mutableStateOf(TextFieldValue(prompt)) }
+    LaunchedEffect(prompt) {
+        if (textFieldValue.text != prompt) {
+            textFieldValue = TextFieldValue(prompt, selection = TextRange(prompt.length))
+        }
+    }
 
     Column(
         modifier = modifier
@@ -2117,11 +2529,99 @@ private fun AgentComposer(
                     .padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        AgentTaskMode.entries.forEach { mode ->
+                            val label = when (mode) {
+                                AgentTaskMode.ASK -> l10n("问答", "Ask")
+                                AgentTaskMode.PLAN -> l10n("计划", "Plan")
+                                AgentTaskMode.EXECUTE -> l10n("执行", "Execute")
+                            }
+                            Surface(
+                                onClick = { onModeChange(mode) },
+                                enabled = !running,
+                                shape = RoundedCornerShape(UiTokens.BadgeRadius),
+                                color = if (selectedMode == mode) QadbTokens.brand else QadbTokens.bg2,
+                                border = BorderStroke(1.dp, if (selectedMode == mode) QadbTokens.brand else QadbTokens.border),
+                                modifier = Modifier.semantics {
+                                    contentDescription = label
+                                    selected = selectedMode == mode
+                                }
+                            ) {
+                                Text(
+                                    text = label,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                                    color = if (selectedMode == mode) Color.White else QadbTokens.textPrimary,
+                                    fontSize = 12.sp
+                                )
+                            }
+                        }
+                    }
+                    if (selectedMode == AgentTaskMode.EXECUTE) {
+                        TextButton(onClick = onOpenEngineSettings) {
+                            Text(l10n("权限", "Permissions"), fontSize = 12.sp)
+                        }
+                    } else {
+                        TextButton(
+                            onClick = { onReadDeviceEvidenceChange(!readDeviceEvidence) },
+                            enabled = !running,
+                            modifier = Modifier.semantics { selected = readDeviceEvidence }
+                        ) {
+                            Text(if (readDeviceEvidence) l10n("设备证据：本次允许", "Device evidence: allowed once")
+                                else l10n("设备证据：关闭", "Device evidence: off"), fontSize = 12.sp)
+                        }
+                    }
+                }
+                Text(
+                    text = if (selectedMode == AgentTaskMode.EXECUTE) {
+                        l10n("执行模式会读取当前设备画面或状态，并按授权操作设备；数据发送至配置的 Provider。", "Execute reads device screen or state and acts under the selected approval policy; data goes to the configured provider.")
+                    } else if (readDeviceEvidence) {
+                        l10n("本次读取所选设备的当前界面文字与状态并发送至配置的 Provider；不会截屏或操作设备。", "For this request, current interface text and state from the selected device go to the configured provider. No screenshot or device action.")
+                    } else {
+                        l10n("仅将输入文字发送至配置的 Provider；不读取或操作设备。", "Only your text is sent to the configured provider; no device access or actions.")
+                    },
+                    color = QadbTokens.textSecondary,
+                    fontSize = 11.sp
+                )
+                if (selectedMode == AgentTaskMode.EXECUTE) {
+                    Text(
+                        text = if (externalEngineSelected) {
+                            l10n("实验 Artemis：可读取所选设备画面与状态；动作经 Bridge 绑定与审批，但目前无法对所有点击识别发送、删除或密码目标。请勿交给它处理这些任务。", "Experimental Artemis can read the selected device screen and state. The Bridge binds and gates actions, but cannot identify every send, delete or password target. Do not assign those tasks to it.")
+                        } else if (approvalPolicy == AgentApprovalPolicy.CAUTIOUS) {
+                            l10n("本任务可访问：所选设备的当前画面与状态；普通导航与滚动自动执行；发送、删除及更多状态变更需逐次确认；支付、账号与密码操作受限。策略：谨慎。", "This task can access the selected device screen and state. Navigation and scrolling run automatically; sending, deletion and more state changes require confirmation. Payments, accounts and passwords are restricted. Policy: Cautious.")
+                        } else {
+                            l10n("本任务可访问：所选设备的当前画面与状态；普通导航与滚动自动执行；发送及删除需逐次确认；支付、账号与密码操作受限。策略：标准。", "This task can access the selected device screen and state. Navigation and scrolling run automatically; sending and deletion require confirmation. Payments, accounts and passwords are restricted. Policy: Standard.")
+                        },
+                        color = QadbTokens.textSecondary,
+                        fontSize = 11.sp
+                    )
+                    if (authorizedPackages.isNotEmpty()) {
+                        Text(
+                            text = l10n("当前任务已授权应用范围：${authorizedPackages.joinToString()}", "Authorized app scope for this task: ${authorizedPackages.joinToString()}"),
+                            color = QadbTokens.brandAction,
+                            fontSize = 11.sp
+                        )
+                    }
+                }
+                if (running) {
+                    Text(l10n("可先起草下一条指令；当前任务结束前不会发送。", "You can draft the next instruction; it will not be sent until the current task ends."),
+                        color = QadbTokens.textSecondary, fontSize = 11.sp)
+                } else if (hasPriorTask && !linkedContinuation) {
+                    Text(l10n("发送将开始独立新任务；若要关联上段，请从任务历史创建新执行段。", "Sending starts an independent task. To link the previous segment, create a new segment from task history."),
+                        color = QadbTokens.textSecondary, fontSize = 11.sp)
+                }
                 // 1. Text Field Area (stays editable while a task runs so the next
                 //    message can be drafted; sending is gated by canSend instead)
                 BasicTextField(
-                    value = prompt,
-                    onValueChange = onPromptChange,
+                    value = textFieldValue,
+                    onValueChange = {
+                        textFieldValue = it
+                        onPromptChange(it.text)
+                    },
                     textStyle = TextStyle(
                         color = QadbTokens.textPrimary,
                         fontSize = 14.sp,
@@ -2136,7 +2636,12 @@ private fun AgentComposer(
                         .onPreviewKeyEvent { event ->
                             when {
                                 event.type != KeyEventType.KeyDown -> false
-                                event.key == Key.Enter && !event.isShiftPressed -> {
+                                shouldSubmitAgentComposerOnEnter(
+                                    keyDown = true,
+                                    enter = event.key == Key.Enter,
+                                    shiftPressed = event.isShiftPressed,
+                                    composingText = textFieldValue.composition != null
+                                ) -> {
                                     if (canSend) onSend()
                                     true
                                 }
@@ -2186,29 +2691,34 @@ private fun AgentComposer(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         // Screen Vision Pill Button
-                        ComposerPillButton(
-                            icon = IconParkIcons.Camera,
-                            text = l10n("屏幕速识", "Quick Vision"),
-                            onClick = onQuickRecognize,
-                            contentColor = QadbTokens.ai
-                        )
+                        if (selectedMode == AgentTaskMode.EXECUTE) {
+                            ComposerPillButton(
+                                icon = IconParkIcons.Camera,
+                                text = l10n("屏幕速识", "Quick Vision"),
+                                onClick = onQuickRecognize,
+                                contentColor = QadbTokens.ai
+                            )
+                        }
 
                         // Model Settings Pill Button
                         ComposerPillButton(
                             icon = IconParkIcons.Setting,
-                            text = if (readiness == AgentReadiness.READY) l10n("模型已就绪", "Model Ready") else l10n("配置模型", "Configure Model"),
+                            text = when {
+                                externalEngineSelected -> "Artemis"
+                                modelConfigured -> l10n("模型已配置", "Model Configured")
+                                else -> l10n("配置模型", "Configure Model")
+                            },
                             onClick = onOpenSettings,
-                            contentColor = if (readiness == AgentReadiness.READY) QadbTokens.success else QadbTokens.warning
+                            contentColor = if (modelConfigured) QadbTokens.success else QadbTokens.warning
                         )
 
-                        // Observation Mode Switch Pill
-                        Surface(
+                        // Observation is required by the screenshot engine; this is status, not a pause control.
+                        if (selectedMode == AgentTaskMode.EXECUTE) Surface(
                             modifier = Modifier
-                                .clip(RoundedCornerShape(UiTokens.BadgeRadius))
-                                .clickable { onObsSwitchChange(!obsSwitchOn) },
+                                .clip(RoundedCornerShape(UiTokens.BadgeRadius)),
                             shape = RoundedCornerShape(UiTokens.BadgeRadius),
-                            color = if (obsSwitchOn) QadbTokens.brand.copy(alpha = 0.12f) else QadbTokens.bg2,
-                            border = BorderStroke(1.dp, if (obsSwitchOn) QadbTokens.brand.copy(alpha = 0.35f) else QadbTokens.border)
+                            color = QadbTokens.bg2,
+                            border = BorderStroke(1.dp, QadbTokens.border)
                         ) {
                             Row(
                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
@@ -2219,13 +2729,13 @@ private fun AgentComposer(
                                     modifier = Modifier
                                         .size(6.dp)
                                         .clip(CircleShape)
-                                        .background(if (obsSwitchOn) QadbTokens.brand else QadbTokens.textSecondary)
+                                        .background(if (running) QadbTokens.brand else QadbTokens.textSecondary)
                                 )
                                 Text(
-                                    text = if (obsSwitchOn) l10n("视觉感知: 开启", "Vision: ON") else l10n("视觉感知: 暂停", "Vision: OFF"),
+                                    text = if (running) l10n("任务执行中 · 按需观察", "Running · observes as needed") else l10n("执行时按需观察", "Observes during tasks"),
                                     fontSize = 11.sp,
                                     fontWeight = FontWeight.Medium,
-                                    color = if (obsSwitchOn) QadbTokens.brand else QadbTokens.textSecondary
+                                    color = QadbTokens.textSecondary
                                 )
                             }
                         }
@@ -2242,6 +2752,23 @@ private fun AgentComposer(
                                 fontFamily = FontFamily.Monospace,
                                 fontSize = 11.sp,
                                 color = QadbTokens.textSecondary
+                            )
+                        }
+
+                        Surface(
+                            onClick = onHistory,
+                            shape = RoundedCornerShape(UiTokens.RadiusSmall),
+                            color = QadbTokens.bg2,
+                            border = BorderStroke(1.dp, QadbTokens.border),
+                            modifier = Modifier.semantics {
+                                contentDescription = l10n("查看任务历史", "View task history")
+                            }
+                        ) {
+                            Icon(
+                                imageVector = IconParkIcons.Time,
+                                contentDescription = null,
+                                tint = QadbTokens.textSecondary,
+                                modifier = Modifier.padding(8.dp).size(15.dp)
                             )
                         }
 
@@ -2310,6 +2837,8 @@ private fun AgentComposer(
                             val primaryAction = when (readiness) {
                                 AgentReadiness.DEVICE_REQUIRED -> onOpenDevices
                                 AgentReadiness.MODEL_REQUIRED -> onOpenSettings
+                                AgentReadiness.MODEL_TEST_REQUIRED -> onOpenSettings
+                                AgentReadiness.ENGINE_UNAVAILABLE -> onOpenEngineSettings
                                 AgentReadiness.READY -> onSend
                                 AgentReadiness.CHECKING -> ({})
                             }
@@ -2317,7 +2846,13 @@ private fun AgentComposer(
                                 AgentReadiness.CHECKING -> l10n("正在检查", "Checking")
                                 AgentReadiness.DEVICE_REQUIRED -> l10n("连接设备", "Connect device")
                                 AgentReadiness.MODEL_REQUIRED -> l10n("配置模型", "Configure model")
-                                AgentReadiness.READY -> l10n("发送指令", "Send")
+                                AgentReadiness.MODEL_TEST_REQUIRED -> l10n("测试模型", "Test model")
+                                AgentReadiness.ENGINE_UNAVAILABLE -> l10n("引擎未就绪", "Engine unavailable")
+                                AgentReadiness.READY -> when {
+                                    linkedContinuation -> l10n("发送新执行段", "Start new segment")
+                                    hasPriorTask -> l10n("发送新任务", "Start new task")
+                                    else -> l10n("发送指令", "Send")
+                                }
                             }
                             Surface(
                                 modifier = Modifier
@@ -2404,17 +2939,16 @@ private fun ComposerPillButton(
 
 @Composable
 private fun DevicePreviewPanel(
-    observationMode: AgentObservationMode,
     screenshot: ByteArray?,
     pageSignature: String?,
     pageChanged: Boolean?,
     totalTokens: Int,
-    contextWindowTokens: Int,
+    lastRequestUsage: AgentUsage?,
+    contextWindowTokens: Int?,
     compactionCount: Int,
     lastObservedAtMs: Long?,
     reduceMotion: Boolean,
-    obsSwitchOn: Boolean,
-    onObsSwitchChange: (Boolean) -> Unit,
+    running: Boolean,
     onCollapse: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -2532,8 +3066,7 @@ private fun DevicePreviewPanel(
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             AgentObservationCard(
-                obsSwitchOn = obsSwitchOn,
-                onObsSwitchChange = onObsSwitchChange,
+                running = running,
                 lastObservedAtMs = lastObservedAtMs,
                 pageSignature = pageSignature,
                 pageChanged = pageChanged,
@@ -2541,6 +3074,7 @@ private fun DevicePreviewPanel(
             )
             AgentTokenCard(
                 totalTokens = totalTokens,
+                lastRequestUsage = lastRequestUsage,
                 contextWindowTokens = contextWindowTokens,
                 compactionCount = compactionCount
             )
@@ -2579,32 +3113,33 @@ private fun DevicePreviewPanel(
 
 @Composable
 private fun AgentObservationCard(
-    obsSwitchOn: Boolean,
-    onObsSwitchChange: (Boolean) -> Unit,
+    running: Boolean,
     lastObservedAtMs: Long?,
     pageSignature: String?,
     pageChanged: Boolean?,
     reduceMotion: Boolean,
     modifier: Modifier = Modifier
 ) {
-    val switchDesc = stringResource(Res.string.agent_obs_switch_desc)
-    val freq = stringResource(Res.string.agent_obs_freq, "2s")
     val caption = if (lastObservedAtMs != null) {
         stringResource(
             Res.string.agent_obs_recent,
             formatClockTime(lastObservedAtMs),
             relativeAgoLabel(lastObservedAtMs)
-        ) + " · " + freq
+        )
     } else {
-        stringResource(Res.string.agent_obs_observing) + " · " + freq
+        l10n("尚无设备画面", "No device frame yet")
     }
-    val pageState = stringResource(if (pageChanged == true) Res.string.agent_changed else Res.string.agent_stable)
+    val pageState = when (pageChanged) {
+        true -> stringResource(Res.string.agent_changed)
+        false -> stringResource(Res.string.agent_stable)
+        null -> l10n("未提供", "Unavailable")
+    }
     Surface(
         modifier = modifier
             .fillMaxWidth()
             .border(
                 1.dp,
-                if (obsSwitchOn) QadbTokens.brand else QadbTokens.border,
+                QadbTokens.border,
                 RoundedCornerShape(UiTokens.RadiusMedium)
             ),
         shape = RoundedCornerShape(UiTokens.RadiusMedium),
@@ -2631,13 +3166,11 @@ private fun AgentObservationCard(
                     )
                     AgentBadge(BadgeSpec("BETA", QadbTokens.aiContainer, QadbTokens.aiText))
                 }
-                Box(
-                    modifier = Modifier.semantics(mergeDescendants = true) {
-                        contentDescription = switchDesc
-                    }
-                ) {
-                    Switch(checked = obsSwitchOn, onCheckedChange = onObsSwitchChange)
-                }
+                Text(
+                    text = l10n("只读状态", "Read only"),
+                    color = QadbTokens.textSecondary,
+                    fontSize = 11.sp
+                )
             }
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -2649,21 +3182,16 @@ private fun AgentObservationCard(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     AgentStatusDot(
-                        color = if (obsSwitchOn) QadbTokens.brand else QadbTokens.textMuted,
-                        breathing = obsSwitchOn,
+                        color = if (running) QadbTokens.brand else QadbTokens.textMuted,
+                        breathing = running,
                         reduceMotion = reduceMotion
                     )
                     Text(
-                        text = stringResource(if (obsSwitchOn) Res.string.agent_obs_watching else Res.string.agent_obs_paused),
+                        text = if (running) l10n("任务运行中，按需获取新画面", "Task running; captures frames as needed") else l10n("未在观察；上次画面不是实时画面", "Not observing; last frame is not live"),
                         color = QadbTokens.textSecondary,
                         fontSize = 12.sp
                     )
                 }
-                Text(
-                    text = stringResource(Res.string.agent_obs_observing),
-                    color = QadbTokens.textSecondary,
-                    fontSize = 11.5.sp
-                )
             }
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(
@@ -2688,24 +3216,16 @@ private fun AgentObservationCard(
 @Composable
 private fun AgentTokenCard(
     totalTokens: Int,
-    contextWindowTokens: Int,
+    lastRequestUsage: AgentUsage?,
+    contextWindowTokens: Int?,
     compactionCount: Int,
     modifier: Modifier = Modifier
 ) {
-    val window = contextWindowTokens.coerceAtLeast(1)
-    val ratio = (totalTokens.toFloat() / window).coerceIn(0f, 1f)
-    val meterColor = when {
-        ratio >= 0.9f -> QadbTokens.danger
-        ratio >= 0.75f -> QadbTokens.warning
-        else -> QadbTokens.brand
-    }
-    val remaining = (window - totalTokens).coerceAtLeast(0)
-    val meterDesc = stringResource(
-        Res.string.agent_token_meter_desc,
-        formatNumber(totalTokens),
-        formatNumber(window),
-        formatNumber(remaining)
-    )
+    val ratio = agentContextFillFraction(lastRequestUsage, contextWindowTokens)
+    val contextLabel = lastRequestUsage?.promptTokens?.takeIf { it > 0 }
+        ?.let(::formatNumber) ?: l10n("未提供", "Unavailable")
+    val windowLabel = contextWindowTokens?.takeIf { it > 0 }
+        ?.let(::formatNumber) ?: l10n("未提供", "Unavailable")
     Surface(
         modifier = modifier
             .fillMaxWidth()
@@ -2738,34 +3258,46 @@ private fun AgentTokenCard(
                     )
                 }
             }
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(4.dp)
-                    .clip(RoundedCornerShape(UiTokens.BadgeRadius))
-                    .background(QadbTokens.bg3)
-                    .semantics { contentDescription = meterDesc }
-            ) {
+            if (ratio != null) {
+                val meterColor = when {
+                    ratio >= 0.9f -> QadbTokens.danger
+                    ratio >= 0.75f -> QadbTokens.warning
+                    else -> QadbTokens.brand
+                }
                 Box(
-                    Modifier
-                        .fillMaxWidth(ratio)
-                        .fillMaxHeight()
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(4.dp)
                         .clip(RoundedCornerShape(UiTokens.BadgeRadius))
-                        .background(meterColor)
-                )
+                        .background(QadbTokens.bg3)
+                        .semantics {
+                            contentDescription = l10n(
+                                "最近请求输入 $contextLabel / 上下文窗口 $windowLabel",
+                                "Last request input $contextLabel / context window $windowLabel"
+                            )
+                        }
+                ) {
+                    Box(
+                        Modifier
+                            .fillMaxWidth(ratio)
+                            .fillMaxHeight()
+                            .clip(RoundedCornerShape(UiTokens.BadgeRadius))
+                            .background(meterColor)
+                    )
+                }
             }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Text(
-                    text = stringResource(Res.string.agent_token_usage, formatNumber(totalTokens), formatNumber(window)),
+                    text = l10n("任务累计 ${formatNumber(totalTokens)} tokens", "Task total ${formatNumber(totalTokens)} tokens"),
                     color = QadbTokens.textSecondary,
                     fontFamily = FontFamily.Monospace,
                     fontSize = 11.5.sp
                 )
                 Text(
-                    text = stringResource(Res.string.agent_token_remaining, formatNumber(remaining)),
+                    text = l10n("最近输入 $contextLabel / 窗口 $windowLabel", "Last input $contextLabel / window $windowLabel"),
                     color = QadbTokens.textSecondary,
                     fontFamily = FontFamily.Monospace,
                     fontSize = 11.5.sp
@@ -2897,9 +3429,9 @@ private fun AgentActionButton(
 @Composable
 private fun runStatusBadge(status: AgentPublicRunStatus): BadgeSpec = when (status) {
     AgentPublicRunStatus.COMPLETED -> BadgeSpec(
-        stringResource(Res.string.agent_badge_completed),
-        QadbTokens.successContainer,
-        QadbTokens.successText
+        l10n("结果待核实", "Outcome unverified"),
+        QadbTokens.warningContainer,
+        QadbTokens.warningText
     )
     AgentPublicRunStatus.FAILED -> BadgeSpec(
         stringResource(Res.string.agent_badge_failed),
@@ -2916,8 +3448,12 @@ private fun runStatusBadge(status: AgentPublicRunStatus): BadgeSpec = when (stat
         QadbTokens.warningContainer,
         QadbTokens.warningText
     )
-    AgentPublicRunStatus.RUNNING,
     AgentPublicRunStatus.CANCELLING -> BadgeSpec(
+        l10n("停止中", "Stopping"),
+        QadbTokens.infoContainer,
+        QadbTokens.infoText
+    )
+    AgentPublicRunStatus.RUNNING -> BadgeSpec(
         stringResource(Res.string.agent_badge_in_progress),
         QadbTokens.infoContainer,
         QadbTokens.infoText
@@ -3039,7 +3575,9 @@ private fun publicToolResultLabel(result: AgentPublicToolResult): String = strin
 
 @Composable
 private fun publicFailureLabel(failure: AgentFailure): String = stringResource(
-    if (failure.code == AgentFailureCode.OUTCOME_UNCERTAIN) {
+    if (failure.code == AgentFailureCode.ENGINE_UNAVAILABLE) {
+        Res.string.agent_failure_engine
+    } else if (failure.code == AgentFailureCode.OUTCOME_UNCERTAIN) {
         Res.string.agent_failure_outcome_uncertain
     } else if (failure.code == AgentFailureCode.MODEL_CALL_TIMED_OUT) {
         Res.string.agent_failure_model_timeout
@@ -3096,5 +3634,11 @@ private fun actionDisplayName(action: AgentAction): String = when (action) {
     is AgentAction.ForceStopPackage -> stringResource(Res.string.agent_action_force_stop, action.packageName)
     is AgentAction.ClearAppData -> stringResource(Res.string.agent_action_clear_data, action.packageName)
     is AgentAction.UninstallPackage -> stringResource(Res.string.agent_action_uninstall, action.packageName)
+    is AgentAction.ExternalApproval -> when (action.actionKind) {
+        "manage_app_stop", "manage_app_force_stop" -> l10n("停止应用", "Stop app")
+        "manage_app_clear", "manage_app_clear_data" -> l10n("清除应用数据", "Clear app data")
+        "manage_app_uninstall" -> l10n("卸载应用", "Uninstall app")
+        else -> l10n("外部设备操作", "External device action")
+    }
     AgentAction.RebootDevice -> stringResource(Res.string.agent_action_reboot)
 }

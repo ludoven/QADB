@@ -1,5 +1,7 @@
 package com.ludoven.adbtool.agent
 
+import com.ludoven.adbtool.agent.artemis.QadbBridgeException
+
 /**
  * Public, presentation-safe Agent activity. This intentionally carries no model prompts,
  * reasoning text, UI hierarchy, element identifiers, coordinates, packages, or typed text.
@@ -126,6 +128,7 @@ enum class AgentFailureStage {
 }
 
 enum class AgentFailureCode {
+    ENGINE_UNAVAILABLE,
     PROTOCOL_INVALID,
     NETWORK_UNAVAILABLE,
     RATE_LIMITED,
@@ -405,6 +408,7 @@ fun AgentAction.toPublicToolSummary(): AgentPublicToolSummary = when (this) {
     is AgentAction.ForceStopPackage -> AgentPublicToolSummary(AgentPublicToolKind.FORCE_STOP_APP)
     is AgentAction.ClearAppData -> AgentPublicToolSummary(AgentPublicToolKind.CLEAR_APP_DATA)
     is AgentAction.UninstallPackage -> AgentPublicToolSummary(AgentPublicToolKind.UNINSTALL_APP)
+    is AgentAction.ExternalApproval -> AgentPublicToolSummary(AgentPublicToolKind.SEMANTIC_GOAL)
     AgentAction.RebootDevice -> AgentPublicToolSummary(AgentPublicToolKind.REBOOT_DEVICE)
 }
 
@@ -455,6 +459,7 @@ fun agentFailureFrom(message: String?): AgentFailure {
     val source = message.orEmpty()
     val normalized = source.lowercase()
     val category = when {
+        normalized.contains("qadb bridge") -> AgentFailureCategory.PROTOCOL
         source.contains(AGENT_OPERATION_TIMEOUT_MESSAGE) ||
             normalized.contains("operation deadline") || normalized.contains("operation timed out") ->
             AgentFailureCategory.VERIFICATION
@@ -504,6 +509,22 @@ fun agentFailureFrom(message: String?): AgentFailure {
 }
 
 fun agentFailureFrom(failure: Throwable): AgentFailure {
+    if (failure is QadbBridgeException) {
+        val category = when (failure.statusCode) {
+            401, 403 -> AgentFailureCategory.UNKNOWN
+            null -> if (failure.retryable) AgentFailureCategory.NETWORK else AgentFailureCategory.PROTOCOL
+            else -> if (failure.retryable) AgentFailureCategory.NETWORK else AgentFailureCategory.PROTOCOL
+        }
+        return AgentFailure(
+            category = category,
+            retryable = failure.retryable,
+            suggestedAction = if (failure.retryable) AgentFailureAction.RETRY else AgentFailureAction.NONE,
+            code = AgentFailureCode.ENGINE_UNAVAILABLE,
+            subsystem = AgentFailureSubsystem.ORCHESTRATOR,
+            stage = AgentFailureStage.CONFIGURATION,
+            technicalDetail = sanitizeAgentDiagnostic(failure.message.orEmpty()).ifBlank { null }
+        )
+    }
     if (failure is AgentOperationTimeoutException) {
         return AgentFailure(
             category = AgentFailureCategory.VERIFICATION,

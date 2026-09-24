@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "managed_runtime": false,
+  "upstream": {
+    "repository": "https://github.com/google/artemis",
+    "commit": "371aa6df56880643da57b30da936e9812fb0ec66"
+  },
+  "patches": [
+    {
+      "path": "patches/0001-route-all-llm-paths-through-configured-provider.patch",
+      "sha256": "2a22683058fbed266d482a1ff5c1cd12c3e079e527d133123026a963e7187a97",
+      "purpose": "Keep configured non-Google providers on the routed model path."
+    },
+    {
+      "path": "patches/0002-gate-final-android-actuators-through-qadb-bridge.patch",
+      "sha256": "ee55bef22379d7f59358f92beafa613dc4fe330b8292e991f84e71c7f064da16",
+      "purpose": "Fail closed at every shared final Android actuator write until QADB grants the exact action digest."
+    },
+    {
+      "path": "patches/0003-redact-readiness-credential-metadata.patch",
+      "sha256": "d592a85f0e1c01d1e3a6167a4a95b2fa31117ae25a921fd4d1b3a371b63c636e",
+      "purpose": "Keep readiness diagnostics limited to masked credential status."
+    },
+    {
+      "path": "patches/0004-bind-policy-worker-to-per-task-context.patch",
+      "sha256": "18e855ec677188c496da9c0c2f53593a7b50b7dedddb39e0f21c0decbdd3abdb",
+      "purpose": "Bind every worker policy request to the immutable upstream task session rather than a daemon-wide environment value."
+    },
+    {
+      "path": "patches/0005-mount-qadb-bridge-on-managed-server.patch",
+      "sha256": "7d9886758b443c44391671424a0324fc88b598971c67a064a6580607b0e4a146",
+      "purpose": "Mount authenticated QADB Bridge routes on the same Artemis loopback service instead of a sidecar port."
+    },
+    {
+      "path": "patches/0006-ack-worker-quiescence-after-cleanup.patch",
+      "sha256": "7094a022d284feaefcad44c9dcafd66628b9f24e782be0c7a257f30a8a1cb2c7",
+      "purpose": "Report worker cleanup completion after the owned task ends so stop can require no in-flight actuator dispatch."
+    }
+  ],
+  "provider_profiles": {
+    "mimo_v2_5": {
+      "provider": "openai",
+      "base_url": "https://api.xiaomimimo.com/v1",
+      "model": "mimo-v2.5",
+      "requires_env": [
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL"
+      ]
+    }
+  },
+  "bridge": {
+    "version": "0.2.2-dev",
+    "entrypoint": "qadb_bridge.py",
+    "payload": [
+      {
+        "path": "bridge/qadb_bridge.py",
+        "sha256": "81db7e8ce3d40a3b9bf71c760aa08ae54450ab8de0af52a249c51903b0cb3676"
+      },
+      {
+        "path": "bridge/qadb_bridge_app.py",
+        "sha256": "98efe892a70d290447b220244155be435be103920c50482e38fe6a6685753cd3"
+      }
+    ],
+    "worker_patch_available": true,
+    "write_workers_supported": false,
+    "requires": [
+      "QADB_BRIDGE_TOKEN",
+      "QADB_BRIDGE_LEDGER",
+      "QADB_BRIDGE_URL",
+      "QADB_TASK_VERSION"
+    ]
+  },
+  "platforms": {
+    "macos_arm64": "development-external-runtime-only",
+    "macos_x64": "not-validated",
+    "windows_x64": "not-validated",
+    "linux_x64": "not-validated"
+  }
+}

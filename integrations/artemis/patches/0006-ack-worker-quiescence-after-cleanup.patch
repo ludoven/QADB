@@ -1,0 +1,92 @@
+diff --git a/artemis/mcp/actuators/qadb_policy.py b/artemis/mcp/actuators/qadb_policy.py
+--- a/artemis/mcp/actuators/qadb_policy.py
++++ b/artemis/mcp/actuators/qadb_policy.py
+@@ -13,7 +13,7 @@
+ 
+ from artemis.mcp.action_types import ActionResult
+ 
+-__all__ = ["BridgePolicyError", "QadbPolicyActuator", "qadb_policy_actuator_from_environment"]
++__all__ = ["BridgePolicyError", "QadbPolicyActuator", "qadb_policy_actuator_from_environment", "qadb_report_worker_finished"]
+ 
+ 
+ class BridgePolicyError(RuntimeError):
+@@ -69,6 +69,9 @@
+ 
+     async def record_result(self, approval_id: str, digest: str, ok: bool) -> None:
+         await self._request("POST", f"/qadb/v1/runs/{self._run_id}/approvals/{approval_id}/result", {"action_digest": digest, "ok": ok})
++
++    async def worker_finished(self) -> None:
++        await self._request("POST", f"/qadb/v1/runs/{self._run_id}/worker-finished")
+ 
+     async def _ensure_registered(self) -> None:
+         async with self._register_lock:
+@@ -164,3 +167,15 @@
+     device = getattr(getattr(ctx, "device", None), "device_id", None)
+     run_id = getattr(ctx, "qadb_run_id", None) or os.environ.get("QADB_RUN_ID", "")
+     return QadbPolicyActuator(actuator, _QadbHttpAuthorizer(base_url, os.environ.get("QADB_BRIDGE_TOKEN", ""), str(run_id), str(device or ""), int(version)))
++
++
++async def qadb_report_worker_finished(run_id: str, device_id: str) -> None:
++    """Report only after task cleanup; a missing acknowledgement remains unconfirmed."""
++    base_url = os.environ.get("QADB_BRIDGE_URL")
++    if not base_url:
++        return
++    authorizer = _QadbHttpAuthorizer(
++        base_url, os.environ.get("QADB_BRIDGE_TOKEN", ""), run_id,
++        device_id, int(os.environ.get("QADB_TASK_VERSION", "0")),
++    )
++    await authorizer.worker_finished()
+diff --git a/artemis/sdk/agent.py b/artemis/sdk/agent.py
+--- a/artemis/sdk/agent.py
++++ b/artemis/sdk/agent.py
+@@ -601,8 +601,10 @@
+         state = self._get_graph_state(task=task)
+         graph_input = state.model_dump()
+         datetime.now(UTC)
++        qadb_cleanup_quiescent = False
+ 
+         async def _execute_task_logic():
++            nonlocal qadb_cleanup_quiescent
+             last_state: State | None = None
+             last_state_snapshot: dict | None = None
+             output = None
+@@ -897,6 +899,7 @@
+ 
+                 raise
+             finally:
++                background_tasks_stopped = True
+                 try:
+                     # Background ADB processes (logcat, screenrecord, ...) started
+                     # by the Operator must not outlive the automation task.
+@@ -904,6 +907,7 @@
+ 
+                     await asyncio.wait_for(shutdown_adb_background_tasks(context), timeout=15.0)
+                 except Exception as e:
++                    background_tasks_stopped = False
+                     logger.warning(f"[{task_name}] Failed to stop background ADB tasks: {e}")
+                 try:
+                     await self._finalize_tracing_safely(task=task, context=context)
+@@ -915,6 +919,7 @@
+                         finally:
+                             if device_lock is not None:
+                                 await asyncio.to_thread(device_lock.release)
++                qadb_cleanup_quiescent = background_tasks_stopped
+ 
+         async with self._task_lock:
+             if self._current_task and not self._current_task.done():
+@@ -941,6 +946,15 @@
+                         await cancel_watcher
+                     except asyncio.CancelledError:
+                         pass
++                if qadb_cleanup_quiescent:
++                    try:
++                        from artemis.mcp.actuators.qadb_policy import qadb_report_worker_finished
++
++                        await asyncio.shield(qadb_report_worker_finished(
++                            task_id, str(self._device_context.device_id)
++                        ))
++                    except Exception as exc:
++                        logger.warning(f"[{task_name}] QADB worker finish acknowledgement failed: {exc}")
+ 
+     async def _watch_external_cancel(self, task_name: str) -> None:
+         """Cancel the running task when another process drops a cancel marker.

@@ -1,0 +1,22 @@
+diff --git a/artemis/sdk/agent.py b/artemis/sdk/agent.py
+index a0028eb..0000000 100644
+--- a/artemis/sdk/agent.py
++++ b/artemis/sdk/agent.py
+@@ -563,6 +563,7 @@ class Agent:
+             ui_adb_client=self._ui_adb_client,
+             llm_config=agent_profile.llm_config,
+             agent_config=self._config,
++            qadb_run_id=task_id,
+         )
+ 
+         output_config = None
+diff --git a/artemis/mcp/actuators/qadb_policy.py b/artemis/mcp/actuators/qadb_policy.py
+index 0000000..0000000 100644
+--- a/artemis/mcp/actuators/qadb_policy.py
++++ b/artemis/mcp/actuators/qadb_policy.py
+@@ -158,3 +158,4 @@ def qadb_policy_actuator_from_environment(ctx: Any, actuator: Any) -> Any:
+         raise BridgePolicyError("QADB_TASK_VERSION must be a non-negative integer")
+     device = getattr(getattr(ctx, "device", None), "device_id", None)
+-    return QadbPolicyActuator(actuator, _QadbHttpAuthorizer(base_url, os.environ.get("QADB_BRIDGE_TOKEN", ""), os.environ.get("QADB_RUN_ID", ""), str(device or ""), int(version)))
++    run_id = getattr(ctx, "qadb_run_id", None) or os.environ.get("QADB_RUN_ID", "")
++    return QadbPolicyActuator(actuator, _QadbHttpAuthorizer(base_url, os.environ.get("QADB_BRIDGE_TOKEN", ""), str(run_id), str(device or ""), int(version)))

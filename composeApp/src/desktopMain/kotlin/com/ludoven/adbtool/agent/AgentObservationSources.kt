@@ -28,6 +28,9 @@ class AdbObservationSource(
         unicodeInput = false
     )
 
+    /** Reuses the observation parser for the final pre-dispatch foreground check. */
+    suspend fun currentActivity(deviceId: String): String = loadCurrentActivity(deviceId)
+
     suspend fun observe(deviceId: String, includeScreenshot: Boolean, includeUiHierarchy: Boolean): AgentObservation = coroutineScope {
         val totalStarted = nowMs()
         val activityTask = async { timed { loadCurrentActivity(deviceId) } }

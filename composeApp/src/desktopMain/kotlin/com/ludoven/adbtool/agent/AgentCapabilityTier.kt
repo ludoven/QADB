@@ -38,7 +38,10 @@ class AgentCapabilityAttestationStore(
             providerFingerprint = profile.capabilityFingerprint(),
             tier = tier,
             verifiedAtMs = verifiedAt,
-            expiresAtMs = verifiedAt + ATTESTATION_TTL_MS
+            // Provider edits and credential changes already invalidate this record.
+            // Requiring a time-based re-test made a persisted model look unconfigured
+            // even though none of its compatibility inputs had changed.
+            expiresAtMs = Long.MAX_VALUE
         )
         preferences.put(attestationKey(profile.id), listOf(
             attestation.providerFingerprint,
@@ -46,6 +49,7 @@ class AgentCapabilityAttestationStore(
             attestation.verifiedAtMs,
             attestation.expiresAtMs
         ).joinToString("|"))
+        preferences.flush()
         return attestation
     }
 
@@ -63,6 +67,7 @@ class AgentCapabilityAttestationStore(
 
     fun invalidate(providerId: String) {
         preferences.remove(attestationKey(providerId))
+        preferences.flush()
     }
 
     private fun attestationKey(providerId: String): String =
@@ -81,5 +86,4 @@ private fun String.safePreferenceHash(): String = MessageDigest.getInstance("SHA
     .digest(toByteArray(Charsets.UTF_8))
     .joinToString("") { "%02x".format(it) }
 
-private const val ATTESTATION_TTL_MS = 7L * 24L * 60L * 60L * 1_000L
 private const val PREFERENCE_HASH_CHARS = 48

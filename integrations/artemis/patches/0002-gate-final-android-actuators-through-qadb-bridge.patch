@@ -1,0 +1,191 @@
+diff --git a/artemis/mcp/actuators/qadb_policy.py b/artemis/mcp/actuators/qadb_policy.py
+new file mode 100644
+--- /dev/null
++++ b/artemis/mcp/actuators/qadb_policy.py
+@@ -0,0 +1,170 @@
++"""Fail-closed QADB policy wrapper for final Android actuator writes."""
++
++from __future__ import annotations
++
++import asyncio
++import hashlib
++import json
++import os
++from typing import Any, Awaitable, Callable, Protocol
++from urllib.error import HTTPError, URLError
++from urllib.parse import urlparse
++from urllib.request import Request, urlopen
++
++from artemis.mcp.action_types import ActionResult
++
++__all__ = ["BridgePolicyError", "QadbPolicyActuator", "qadb_policy_actuator_from_environment"]
++
++
++class BridgePolicyError(RuntimeError):
++    """A required QADB decision was absent, rejected, or unavailable."""
++
++
++class _ActionAuthorizer(Protocol):
++    async def authorize(self, action: str, args: dict[str, Any]) -> tuple[str, str]: ...
++    async def record_result(self, approval_id: str, digest: str, ok: bool) -> None: ...
++
++
++class _QadbHttpAuthorizer:
++    """Small stdlib-only client for the loopback QADB Bridge protocol."""
++
++    def __init__(self, base_url: str, token: str, run_id: str, device_id: str, task_version: int):
++        uri = urlparse(base_url)
++        if uri.scheme not in {"http", "https"} or uri.hostname not in {"127.0.0.1", "::1", "localhost"}:
++            raise BridgePolicyError("QADB bridge must use a loopback HTTP URL")
++        if not token or not run_id or not device_id:
++            raise BridgePolicyError("QADB bridge token, run id, and device id are required")
++        self._base_url = base_url.rstrip("/")
++        self._token = token
++        self._run_id = run_id
++        self._device_id = device_id
++        self._task_version = task_version
++        self._registered = False
++        self._register_lock = asyncio.Lock()
++
++    async def authorize(self, action: str, args: dict[str, Any]) -> tuple[str, str]:
++        await self._ensure_registered()
++        digest = hashlib.sha256(
++            json.dumps({"action": action, "args": args}, sort_keys=True, separators=(",", ":")).encode()
++        ).hexdigest()
++        action_kind = action
++        action_target = str(args.get("app_name", "")) if action == "manage_app" else None
++        if action == "manage_app":
++            intent = str(args.get("action", "")).strip().lower()
++            action_kind = f"manage_app_{intent}" if intent else action
++        if action == "press_key":
++            key_name = str(args.get("key", "")).strip().upper()
++            if key_name in {"66", "160"} or "ENTER" in key_name:
++                action_kind, action_target = "press_key_enter", "Enter / submit key"
++        prepared = await self._request("POST", f"/qadb/v1/runs/{self._run_id}/actions", {"action_digest": digest, "action_kind": action_kind, "action_target": action_target})
++        approval_id = str(prepared.get("approvalId", ""))
++        if not approval_id:
++            raise BridgePolicyError("QADB bridge did not return an approval id")
++        # Only the desktop host may heartbeat: self-heartbeating would defeat
++        # the stop barrier that protects a disconnected QADB process.
++        for _ in range(150):
++            status = await self._request("GET", f"/qadb/v1/runs/{self._run_id}/approvals/{approval_id}")
++            if status.get("allowed") is True:
++                await self._request("POST", f"/qadb/v1/runs/{self._run_id}/approvals/{approval_id}/dispatch", {"action_digest": digest})
++                return approval_id, digest
++            if status.get("pending") is not True:
++                raise BridgePolicyError("QADB action approval was rejected or expired")
++            await asyncio.sleep(0.2)
++        raise BridgePolicyError("QADB action approval timed out")
++
++    async def record_result(self, approval_id: str, digest: str, ok: bool) -> None:
++        await self._request("POST", f"/qadb/v1/runs/{self._run_id}/approvals/{approval_id}/result", {"action_digest": digest, "ok": ok})
++
++    async def _ensure_registered(self) -> None:
++        async with self._register_lock:
++            if self._registered:
++                return
++            await self._request("POST", f"/qadb/v1/runs/{self._run_id}", {"device_id": self._device_id, "task_version": self._task_version})
++            self._registered = True
++
++    async def _request(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
++        def send() -> dict[str, Any]:
++            data = json.dumps(payload).encode() if payload is not None else None
++            request = Request(
++                f"{self._base_url}{path}", data=data, method=method,
++                headers={"Accept": "application/json", "Content-Type": "application/json", "X-QADB-Token": self._token},
++            )
++            try:
++                with urlopen(request, timeout=5) as response:  # noqa: S310 - loopback was validated
++                    return json.loads(response.read().decode())
++            except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as error:
++                raise BridgePolicyError(f"QADB bridge request failed: {error}") from error
++        return await asyncio.to_thread(send)
++
++
++class QadbPolicyActuator:
++    """Guards each write-capable Actuator method immediately before dispatch."""
++
++    def __init__(self, delegate: Any, authorizer: _ActionAuthorizer):
++        self._delegate = delegate
++        self._authorizer = authorizer
++        self.ctx = getattr(delegate, "ctx", None)
++        self.controller = getattr(delegate, "controller", None)
++
++    def capabilities(self):
++        return self._delegate.capabilities()
++
++    def extensions(self):
++        return self._delegate.extensions()
++
++    def __getattr__(self, name: str):
++        return getattr(self._delegate, name)
++
++    async def _execute(self, action: str, args: dict[str, Any], call: Callable[[], Awaitable[ActionResult]]) -> ActionResult:
++        approval_id, digest = await self._authorizer.authorize(action, args)
++        try:
++            result = await call()
++        except BaseException:
++            await self._authorizer.record_result(approval_id, digest, False)
++            raise
++        await self._authorizer.record_result(approval_id, digest, result.ok)
++        return result
++
++    async def click_sequence(self, points, delay_ms=50):
++        return await self._execute("click_sequence", {"points": points, "delay_ms": delay_ms}, lambda: self._delegate.click_sequence(points, delay_ms))
++
++    async def click(self, nx, ny, times=1, delay_ms=100):
++        return await self._execute("click", {"nx": nx, "ny": ny, "times": times, "delay_ms": delay_ms}, lambda: self._delegate.click(nx, ny, times, delay_ms))
++
++    async def long_press(self, nx, ny, duration_ms=1000):
++        return await self._execute("long_press", {"nx": nx, "ny": ny, "duration_ms": duration_ms}, lambda: self._delegate.long_press(nx, ny, duration_ms))
++
++    async def input_text(self, text, target=None, clear_exist=True):
++        return await self._execute("input_text", {"text": text, "target": target, "clear_exist": clear_exist}, lambda: self._delegate.input_text(text, target, clear_exist))
++
++    async def swipe(self, start, end, duration_ms=800):
++        return await self._execute("swipe", {"start": start, "end": end, "duration_ms": duration_ms}, lambda: self._delegate.swipe(start, end, duration_ms))
++
++    async def press_key(self, key):
++        return await self._execute("press_key", {"key": key}, lambda: self._delegate.press_key(key))
++
++    async def manage_app(self, action, app_name):
++        return await self._execute("manage_app", {"action": action, "app_name": app_name}, lambda: self._delegate.manage_app(action, app_name))
++
++    async def open_link(self, url):
++        return await self._execute("open_link", {"url": url}, lambda: self._delegate.open_link(url))
++
++    async def erase_one_char(self):
++        return await self._execute("erase_one_char", {}, self._delegate.erase_one_char)
++
++    async def focus_and_clear_text(self, nx, ny):
++        return await self._execute("focus_and_clear_text", {"nx": nx, "ny": ny}, lambda: self._delegate.focus_and_clear_text(nx, ny))
++
++
++def qadb_policy_actuator_from_environment(ctx: Any, actuator: Any) -> Any:
++    """Returns the actuator unchanged unless the managed Bridge is configured."""
++    if isinstance(actuator, QadbPolicyActuator):
++        return actuator
++    base_url = os.environ.get("QADB_BRIDGE_URL")
++    if not base_url:
++        return actuator
++    version = os.environ.get("QADB_TASK_VERSION")
++    if version is None or not version.isdigit():
++        raise BridgePolicyError("QADB_TASK_VERSION must be a non-negative integer")
++    device = getattr(getattr(ctx, "device", None), "device_id", None)
++    return QadbPolicyActuator(actuator, _QadbHttpAuthorizer(base_url, os.environ.get("QADB_BRIDGE_TOKEN", ""), os.environ.get("QADB_RUN_ID", ""), str(device or ""), int(version)))
+diff --git a/artemis/mcp/action_session.py b/artemis/mcp/action_session.py
+index 4666d43..1111636 100644
+--- a/artemis/mcp/action_session.py
++++ b/artemis/mcp/action_session.py
+@@ -233,5 +233,11 @@ async def get_action_session(ctx: Any, actuator: Any = None) -> ActionSession:
+     from artemis.mcp.action_server import build_action_server
+     from artemis.mcp.actuators.adb import AdbActuator
++    from artemis.mcp.actuators.qadb_policy import qadb_policy_actuator_from_environment
+ 
+     actuator = actuator or getattr(ctx, "actuator", None) or AdbActuator(ctx)
++    actuator = qadb_policy_actuator_from_environment(ctx, actuator)
++    try:
++        ctx.actuator = actuator
++    except Exception:
++        logger.debug("Could not retain the selected actuator on ctx.")
+     server = build_action_server(actuator)

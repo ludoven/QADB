@@ -188,6 +188,28 @@ class ScreenshotAgentEngineTest {
     }
 
     @Test
+    fun approvalIsInvalidatedWhenTheScreenChangesBeforeDispatch() = runBlocking {
+        val device = FakeScreenshotDevice(changeScreenshot = true)
+        val model = FakeScreenshotModel { request, _ ->
+            ScreenshotAgentDecision.Execute(
+                AgentAction.Tap(
+                    500, 900, request.frame.observationId,
+                    meta = AgentActionMeta(target = "send", operationKind = AgentOperationKind.SEND)
+                ),
+                request.frame.revision
+            )
+        }
+
+        val result = ScreenshotAgentEngine(
+            model, device, taskLogStoreProvider = { NoopAgentTaskLogStore }
+        ).run("发送消息", "device", onState = {}, confirmSensitiveAction = { true })
+
+        assertTrue(result.needsUser)
+        assertTrue(result.messages.last().text.contains("原授权失效"))
+        assertTrue(device.executed.isEmpty())
+    }
+
+    @Test
     fun openAiProtocolParsesOneNormalizedTapBoundToExactRevision() {
         val frame = ScreenshotObservationFrame(
             revision = 42,
@@ -215,6 +237,51 @@ class ScreenshotAgentEngineTest {
     }
 
     @Test
+    fun openAiProtocolAcceptsLegacyFunctionCallWithObjectArguments() {
+        val frame = screenshotFrame()
+        val response = buildJsonObject {
+            put("choices", buildJsonArray {
+                add(buildJsonObject {
+                    put("message", buildJsonObject {
+                        put("function_call", buildJsonObject {
+                            put("name", "finish")
+                            put("arguments", buildJsonObject {
+                                put("summary", "done")
+                                put("revision", "42")
+                            })
+                        })
+                    })
+                })
+            })
+        }
+
+        val decision = OpenAiCompatibleClient().parseScreenshotAgentDecision(response, frame)
+
+        assertEquals("done", (decision as ScreenshotAgentDecision.Finish).summary)
+    }
+
+    @Test
+    fun openAiProtocolAcceptsExactJsonToolCallContent() {
+        val frame = screenshotFrame()
+        val response = buildJsonObject {
+            put("choices", buildJsonArray {
+                add(buildJsonObject {
+                    put("message", buildJsonObject {
+                        put(
+                            "content",
+                            """{"name":"finish","arguments":{"summary":"done","revision":"42"}}"""
+                        )
+                    })
+                })
+            })
+        }
+
+        val decision = OpenAiCompatibleClient().parseScreenshotAgentDecision(response, frame)
+
+        assertEquals("done", (decision as ScreenshotAgentDecision.Finish).summary)
+    }
+
+    @Test
     fun progressProtocolRequiresConcreteNextMilestoneForContinue() {
         val response = screenshotToolResponse(
             "assess_progress",
@@ -226,6 +293,17 @@ class ScreenshotAgentEngineTest {
         assertTrue(result.isFailure)
     }
 }
+
+private fun screenshotFrame() = ScreenshotObservationFrame(
+    revision = 42,
+    observationId = "observation",
+    screenshot = byteArrayOf(1),
+    screenshotMimeType = "image/png",
+    deviceWidth = 1_080,
+    deviceHeight = 1_920,
+    foregroundApp = null,
+    uiHint = null
+)
 
 private fun screenshotToolResponse(name: String, arguments: String) = buildJsonObject {
     put("choices", buildJsonArray {

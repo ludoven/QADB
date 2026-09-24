@@ -137,26 +137,34 @@ class RealAgentDeviceGateway(
         if (!isConnected(deviceId)) {
             return AgentToolResult(false, "The selected device is no longer connected")
         }
+        if (action.requiresAgentForegroundCheck() && !currentForegroundMatchesObservation(deviceId)) {
+            return AgentToolResult(false, "Foreground app changed or could not be verified; observe again")
+        }
         return when (action) {
             AgentAction.Observe -> AgentToolResult(true, "Observation refreshed")
             is AgentAction.FindApp -> findApp(deviceId, action.query)
             is AgentAction.OpenApp -> openApp(deviceId, action.query)
-            is AgentAction.Tap -> tap(deviceId, action.x, action.y)
+            is AgentAction.Tap -> {
+                if (observations[deviceId]?.observationId != action.observationId) {
+                    AgentToolResult(false, "The coordinate action references a stale observation")
+                } else {
+                    tap(deviceId, action.x, action.y)
+                }
+            }
             is AgentAction.TapElement -> {
                 val node = resolveNode(deviceId, action.observationId, action.elementId)
                     ?: return AgentToolResult(false, "The element reference is stale; observe again")
                 tap(deviceId, node.bounds.centerX, node.bounds.centerY)
             }
-            is AgentAction.Swipe -> adbResult(
-                AdbTool.execAdbWithTimeoutAsync(
-                    ADB_ACTION_TIMEOUT_MILLIS,
-                    "-s", deviceId, "shell", "input", "swipe",
+            is AgentAction.Swipe -> adbResult(AdbTool.execAdbWithTimeoutAsync(
+                    ADB_ACTION_TIMEOUT_MILLIS, "-s", deviceId, "shell", "input", "swipe",
                     action.startX.toString(), action.startY.toString(),
-                    action.endX.toString(), action.endY.toString(),
-                    action.durationMs.toString()
-                )
-            )
+                    action.endX.toString(), action.endY.toString(), action.durationMs.toString()
+                ))
             is AgentAction.InputText -> {
+                if (observations[deviceId]?.observationId != action.observationId) {
+                    return AgentToolResult(false, "Text input references a stale observation")
+                }
                 var targetNode: UiNodeSnapshot? = null
                 action.elementId?.let { elementId ->
                     val observationId = action.observationId
@@ -174,12 +182,9 @@ class RealAgentDeviceGateway(
                 }
                 inputHelper.input(deviceId, action.text, allowInstall = true)
             }
-            is AgentAction.KeyEvent -> adbResult(
-                AdbTool.execAdbWithTimeoutAsync(
-                    ADB_ACTION_TIMEOUT_MILLIS,
-                    "-s", deviceId, "shell", "input", "keyevent", action.key.androidKeyCode
-                )
-            )
+            is AgentAction.KeyEvent -> adbResult(AdbTool.execAdbWithTimeoutAsync(
+                    ADB_ACTION_TIMEOUT_MILLIS, "-s", deviceId, "shell", "input", "keyevent", action.key.androidKeyCode
+                ))
             is AgentAction.LaunchPackage -> {
                 if (!appCatalog.isInstalled(deviceId, action.packageName)) {
                     AgentToolResult(false, "Package is not in the installed application catalog")
@@ -204,6 +209,7 @@ class RealAgentDeviceGateway(
                 )
             )
             is AgentAction.Finish -> AgentToolResult(true, action.summary)
+            is AgentAction.ExternalApproval -> AgentToolResult(false, "Bridge approvals cannot execute through ADB")
         }
     }
 
@@ -274,6 +280,13 @@ class RealAgentDeviceGateway(
             ?.uiNodes
             ?.firstOrNull { it.elementId == elementId }
 
+    private suspend fun currentForegroundMatchesObservation(deviceId: String): Boolean = runCatching {
+        matchesAgentForegroundActivity(
+            observations[deviceId]?.currentActivity.orEmpty(),
+            adbObservationSource.currentActivity(deviceId)
+        )
+    }.getOrDefault(false)
+
     private fun adbResult(result: AdbTool.AdbResult): AgentToolResult = AgentToolResult(
         success = result.success,
         output = if (result.success) {
@@ -282,6 +295,18 @@ class RealAgentDeviceGateway(
             result.errorMessage ?: result.output.ifBlank { "ADB action failed" }
         }
     )
+}
+
+internal fun matchesAgentForegroundActivity(expected: String, current: String): Boolean {
+    val expectedPackage = expected.substringBefore('/').takeIf { '/' in expected && it.isNotBlank() }
+    val currentPackage = current.substringBefore('/').takeIf { '/' in current && it.isNotBlank() }
+    return expectedPackage != null && expectedPackage == currentPackage
+}
+
+internal fun AgentAction.requiresAgentForegroundCheck(): Boolean = when (this) {
+    is AgentAction.Tap, is AgentAction.TapElement, is AgentAction.Swipe,
+    is AgentAction.InputText, is AgentAction.KeyEvent -> true
+    else -> false
 }
 
 private const val ADB_ACTION_TIMEOUT_SECONDS = 30L

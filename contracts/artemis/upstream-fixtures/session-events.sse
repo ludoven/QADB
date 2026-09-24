@@ -1,0 +1,9 @@
+event: session_started
+data: {"session_id":"other-session"}
+
+event: startup_progress
+data: {"session_id":"11111111-1111-1111-1111-111111111111","message":"正在连接设备"}
+
+event: session_ended
+data: {"session_id":"other-session"}
+

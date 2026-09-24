@@ -165,6 +165,7 @@ class ScreenshotAgentEngine(
         confirmSensitiveAction: suspend (AgentStep) -> Boolean
     ): AgentTaskUiState {
         val activeRunId = runId?.takeIf(String::isNotBlank) ?: UUID.randomUUID().toString()
+        val approvalPolicy = riskEvaluator.policySnapshot()
         var modelCalls = 0
         var usage = AgentUsage()
         var actionCount = 0
@@ -270,6 +271,15 @@ class ScreenshotAgentEngine(
             }
 
             var observation = observeFresh(deviceId)
+            val initialForegroundPkg = observation.currentActivity?.substringBefore('/')?.takeIf { '/' in observation.currentActivity && it.isNotBlank() }
+            val initialAuthorized = if (state.authorizedPackages.isNotEmpty()) {
+                state.authorizedPackages
+            } else if (initialForegroundPkg != null && initialForegroundPkg !in SYSTEM_EXEMPT_PACKAGES && !initialForegroundPkg.contains("launcher", ignoreCase = true)) {
+                setOf(initialForegroundPkg)
+            } else {
+                emptySet()
+            }
+            state = state.copy(authorizedPackages = initialAuthorized)
             while (actionCount < hardActionLimit) {
                 val frame = observation.toScreenshotFrame()
                 state = state.copy(
@@ -299,6 +309,7 @@ class ScreenshotAgentEngine(
                     val progress = progressResult.first
                     modelCalls += progressResult.second
                     usage += progress.usage
+                    state = state.copy(lastRequestUsage = progress.usage)
                     updateBudget()
                     when (progress.assessment.verdict) {
                         ProgressVerdict.FINISH -> return complete(progress.assessment.evidence)
@@ -322,6 +333,7 @@ class ScreenshotAgentEngine(
                 val result = decideWithSingleProtocolRetry(request)
                 modelCalls += result.second
                 usage += result.first.usage
+                state = state.copy(lastRequestUsage = result.first.usage)
                 updateBudget()
                 val decision = result.first.decision
                 if (decision.revision != frame.revision) {
@@ -335,7 +347,7 @@ class ScreenshotAgentEngine(
                 }
 
                 val normalizedAction = (decision as ScreenshotAgentDecision.Execute).action
-                val action = normalizedAction.fromPermille(frame)
+                var action = normalizedAction.fromPermille(frame)
                 validateScreenshotAgentAction(action, observation).getOrElse {
                     return fail("Model protocol error: ${it.message}")
                 }
@@ -351,7 +363,13 @@ class ScreenshotAgentEngine(
                     AgentOperationKind.SEND -> "Confirm sending the requested content"
                     else -> null
                 }
-                val risk = riskEvaluator.evaluate(action, observation, localSafetyReason)
+                val risk = riskEvaluator.evaluate(
+                    action = action,
+                    observation = observation,
+                    localCapabilityReason = localSafetyReason,
+                    policy = approvalPolicy,
+                    authorizedPackages = state.authorizedPackages
+                )
                 if (risk.level == AgentRiskLevel.BLOCKED) return fail("Task blocked: ${risk.reason}")
                 var step = AgentStep(
                     id = UUID.randomUUID().toString(),
@@ -377,7 +395,36 @@ class ScreenshotAgentEngine(
                 publish()
                 if (risk.level == AgentRiskLevel.CONFIRMATION_REQUIRED) {
                     if (!confirmSensitiveAction(step)) return needsUser("用户取消了需要确认的操作。")
-                    step = step.copy(status = AgentStepStatus.RUNNING)
+                    val targetPkg = when (action) {
+                        is AgentAction.LaunchPackage -> action.packageName
+                        is AgentAction.ForceStopPackage -> action.packageName
+                        is AgentAction.ClearAppData -> action.packageName
+                        is AgentAction.UninstallPackage -> action.packageName
+                        else -> observation.currentActivity?.substringBefore('/')?.takeIf { '/' in observation.currentActivity && it.isNotBlank() }
+                    }
+                    if (targetPkg != null && targetPkg !in SYSTEM_EXEMPT_PACKAGES && !targetPkg.contains("launcher", ignoreCase = true)) {
+                        state = state.copy(authorizedPackages = state.authorizedPackages + targetPkg)
+                    }
+                    val refreshed = runCatching { observeFresh(deviceId) }.getOrElse {
+                        return needsUser("确认后无法重新观察设备，未执行该操作。")
+                    }
+                    if (refreshed.visualFingerprint() != observation.visualFingerprint() ||
+                        refreshed.uiHierarchy != observation.uiHierarchy ||
+                        refreshed.screenWidth != observation.screenWidth ||
+                        refreshed.screenHeight != observation.screenHeight
+                    ) {
+                        return needsUser("确认期间设备画面已变化，原授权失效；请重新提交目标。")
+                    }
+                    action = when (action) {
+                        is AgentAction.Tap -> action.copy(observationId = refreshed.observationId)
+                        is AgentAction.InputText -> action.copy(observationId = refreshed.observationId)
+                        else -> action
+                    }
+                    validateScreenshotAgentAction(action, refreshed).getOrElse {
+                        return needsUser("确认后的操作目标已失效，未执行该操作。")
+                    }
+                    observation = refreshed
+                    step = step.copy(action = action, status = AgentStepStatus.RUNNING)
                     state = state.replaceScreenshotStep(step).copy(
                         pendingConfirmation = null,
                         phase = AgentRunPhase.EXECUTING
@@ -390,6 +437,16 @@ class ScreenshotAgentEngine(
                 state = state.replaceScreenshotStep(step)
                 val toolResult = withTimeout(SCREENSHOT_AGENT_DEVICE_TIMEOUT_MS) {
                     deviceGateway.execute(deviceId, action)
+                }
+                if (toolResult.success) {
+                    val launchedPkg = when (action) {
+                        is AgentAction.LaunchPackage -> action.packageName
+                        is AgentAction.OpenApp -> toolResult.resolvedPackages.firstOrNull()
+                        else -> null
+                    }
+                    if (launchedPkg != null && launchedPkg !in SYSTEM_EXEMPT_PACKAGES && !launchedPkg.contains("launcher", ignoreCase = true)) {
+                        state = state.copy(authorizedPackages = state.authorizedPackages + launchedPkg)
+                    }
                 }
                 actionCount += 1
                 state = state.copy(phase = AgentRunPhase.OBSERVING)

@@ -777,6 +777,7 @@
     <string name="agent_public_result_unverified">Could not verify</string>
     <string name="agent_public_result_failed">Failed</string>
     <string name="agent_public_result_denied">Denied</string>
+    <string name="agent_failure_engine">The Artemis engine connection failed. Try again.</string>
     <string name="agent_failure_protocol">The model returned a format that could not be executed. Try again.</string>
     <string name="agent_failure_network">Network connection failed. Check your connection and try again.</string>
     <string name="agent_failure_model_timeout">The model took longer than 30 seconds to respond. Retry; if it persists, check the Provider latency or timeout settings.</string>

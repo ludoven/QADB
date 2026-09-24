@@ -241,6 +241,7 @@ compose.desktop {
 
         nativeDistributions {
             targetFormats(*nativeTargetFormats)
+            modules("java.base", "java.desktop", "java.logging", "java.net.http", "java.sql", "java.naming", "jdk.unsupported")
             appResourcesRootDir.set(project.layout.projectDirectory.dir("src/desktopMain/appResources"))
 
             packageVersion = appVersion

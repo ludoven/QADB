@@ -8,15 +8,23 @@ data class AgentRiskAssessment(
 class AgentRiskEvaluator(
     private val approvalPreferences: AgentApprovalPreferences = AgentApprovalRuntime.preferences
 ) {
+    fun policySnapshot(): AgentApprovalPolicy = approvalPreferences.policy.value
+
     fun evaluate(
         action: AgentAction,
         observation: AgentObservation,
-        localCapabilityReason: String? = null
+        localCapabilityReason: String? = null,
+        policy: AgentApprovalPolicy = policySnapshot(),
+        authorizedPackages: Set<String> = emptySet()
     ): AgentRiskAssessment {
         val targetNode = actionTargetNode(action, observation)
         val targetText = targetNode.targetText()
         val canCommitUiAction = action is AgentAction.Tap || action is AgentAction.TapElement
-        if ((action is AgentAction.InputText && targetNode?.password == true) ||
+        if ((action is AgentAction.InputText && (
+                targetNode?.password == true ||
+                    action.meta.operationKind in BLOCKED_OPERATION_KINDS ||
+                    (targetNode == null && observation.uiNodes.any { it.password })
+                )) ||
             canCommitUiAction && (
                 action.meta.operationKind in BLOCKED_OPERATION_KINDS || targetText.hasBlockedRiskTerm()
             )
@@ -26,8 +34,45 @@ class AgentRiskEvaluator(
                 "Payments, account changes, and password entry are outside the enabled Agent scope"
             )
         }
+        if (authorizedPackages.isNotEmpty()) {
+            val targetPkg = when (action) {
+                is AgentAction.LaunchPackage -> action.packageName
+                is AgentAction.ForceStopPackage -> action.packageName
+                is AgentAction.ClearAppData -> action.packageName
+                is AgentAction.UninstallPackage -> action.packageName
+                else -> null
+            }
+            if (targetPkg != null && targetPkg !in authorizedPackages) {
+                return AgentRiskAssessment(
+                    AgentRiskLevel.CONFIRMATION_REQUIRED,
+                    "Confirm action on package $targetPkg outside authorized scope"
+                )
+            }
+            if (canCommitUiAction || action is AgentAction.InputText || action is AgentAction.Swipe ||
+                (action is AgentAction.KeyEvent && action.key == AgentKey.ENTER)
+            ) {
+                val nodePkg = targetNode?.packageName?.takeIf(String::isNotBlank)
+                val foregroundPkg = observation.currentActivity?.substringBefore('/')?.takeIf { '/' in observation.currentActivity && it.isNotBlank() }
+                val activePkg = nodePkg ?: foregroundPkg
+                if (activePkg != null && activePkg !in authorizedPackages && activePkg !in SYSTEM_EXEMPT_PACKAGES) {
+                    return AgentRiskAssessment(
+                        AgentRiskLevel.CONFIRMATION_REQUIRED,
+                        "Current app $activePkg is outside authorized scope; confirm action"
+                    )
+                }
+            }
+        }
         if (!localCapabilityReason.isNullOrBlank()) {
             return AgentRiskAssessment(AgentRiskLevel.CONFIRMATION_REQUIRED, localCapabilityReason)
+        }
+        if (canCommitUiAction &&
+            (action.meta.operationKind == AgentOperationKind.SEND || targetText.isSendControl()) ||
+            action is AgentAction.KeyEvent && action.key == AgentKey.ENTER
+        ) {
+            return AgentRiskAssessment(
+                AgentRiskLevel.CONFIRMATION_REQUIRED,
+                "Confirm the current send or submit action on the device"
+            )
         }
         if (action.requiresConfirmation) {
             return AgentRiskAssessment(
@@ -36,11 +81,20 @@ class AgentRiskEvaluator(
             )
         }
 
+        if (policy == AgentApprovalPolicy.CAUTIOUS &&
+            (action is AgentAction.InputText || action is AgentAction.ForceStopPackage || action is AgentAction.RebootDevice)
+        ) {
+            return AgentRiskAssessment(
+                AgentRiskLevel.CONFIRMATION_REQUIRED,
+                "Cautious policy requires confirmation before changing device or application state"
+            )
+        }
+
         val modelRisk = canCommitUiAction && action.meta.operationKind == AgentOperationKind.DELETE
         val explicitTargetRisk = canCommitUiAction && targetText.hasDestructiveRiskTerm()
         val cautiousTextRisk = canCommitUiAction && targetText.hasCautiousOnlyRiskTerm()
         val requiresConfirmation = modelRisk || explicitTargetRisk ||
-            (approvalPreferences.policy.value == AgentApprovalPolicy.CAUTIOUS && cautiousTextRisk)
+            (policy == AgentApprovalPolicy.CAUTIOUS && cautiousTextRisk)
         return if (requiresConfirmation) {
             val target = action.meta.target.ifBlank { targetText.take(80).ifBlank { action.toolName } }
             AgentRiskAssessment(
@@ -80,6 +134,12 @@ private fun UiNodeSnapshot?.targetText(): String = this?.let {
 private fun String.hasBlockedRiskTerm(): Boolean =
     BLOCKED_ENGLISH_RISK.containsMatchIn(lowercase()) || BLOCKED_CHINESE_RISK.any(::contains)
 
+private fun String.isSendControl(): Boolean {
+    val normalized = trim().lowercase()
+    return normalized in setOf("send", "submit", "发送", "提交") ||
+        normalized.startsWith("send ") || normalized.startsWith("发送 ")
+}
+
 /** Only irreversible data and application removal controls require approval. */
 private fun String.hasDestructiveRiskTerm(): Boolean {
     val english = lowercase()
@@ -96,3 +156,12 @@ private val CAUTIOUS_ENGLISH_RISK = Regex("\\b(remove|clear)\\b")
 private val CAUTIOUS_CHINESE_RISK = listOf("移除", "清除")
 private val BLOCKED_ENGLISH_RISK = Regex("\\b(pay|purchase|buy|checkout|sign in|log in|register|create account|password|passcode)\\b")
 private val BLOCKED_CHINESE_RISK = listOf("付款", "支付", "购买", "下单", "结账", "登录", "注册账号", "创建账号", "密码", "口令")
+
+internal val SYSTEM_EXEMPT_PACKAGES = setOf(
+    "com.android.systemui",
+    "com.android.permissioncontroller",
+    "com.google.android.permissioncontroller",
+    "com.google.android.inputmethod.latin",
+    "com.android.inputmethod.latin",
+    "com.ludoven.adbtool.ime"
+)

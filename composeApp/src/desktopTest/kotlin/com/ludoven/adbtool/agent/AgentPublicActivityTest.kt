@@ -1,5 +1,6 @@
 package com.ludoven.adbtool.agent
 
+import com.ludoven.adbtool.agent.artemis.QadbBridgeException
 import com.ludoven.adbtool.viewmodel.AgentOrchestratorPublicEventAdapter
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -383,6 +384,19 @@ class AgentPublicActivityTest {
         assertEquals(AgentFailureSubsystem.PROVIDER, failure.subsystem)
         assertEquals(AgentFailureStage.PLANNING, failure.stage)
         assertTrue(failure.retryable)
+    }
+
+    @Test
+    fun `transient Bridge failure is attributed to Artemis configuration instead of model protocol`() {
+        val failure = agentFailureFrom(
+            QadbBridgeException("QADB Bridge request failed with HTTP 503", statusCode = 503, retryable = true)
+        )
+
+        assertEquals(AgentFailureCategory.NETWORK, failure.category)
+        assertEquals(AgentFailureCode.ENGINE_UNAVAILABLE, failure.code)
+        assertEquals(AgentFailureSubsystem.ORCHESTRATOR, failure.subsystem)
+        assertEquals(AgentFailureStage.CONFIGURATION, failure.stage)
+        assertEquals(AgentFailureAction.RETRY, failure.suggestedAction)
     }
 
     private fun reduce(

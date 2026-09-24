@@ -1,7 +1,5 @@
 package com.ludoven.adbtool.pages
 
-import androidx.compose.foundation.gestures.detectTapGestures
-
 import adbtool_desktop.composeapp.generated.resources.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -971,7 +969,7 @@ private fun AppColumnHeaderText(
     )
 }
 
-@OptIn(ExperimentalComposeUiApi::class)
+@OptIn(ExperimentalComposeUiApi::class, ExperimentalFoundationApi::class)
 @Composable
 private fun AppListRow(
     app: AppInfo,
@@ -995,7 +993,7 @@ private fun AppListRow(
             .hoverable(rowInteraction)
             .clip(shape)
             .background(if (isRowHovered) AppVisualTokens.Soft.copy(alpha = 0.55f) else Color.Transparent)
-            .pointerInput(app.packageName) { detectTapGestures(onDoubleTap = { onOpen() }) }
+            .combinedClickable(onClick = {}, onDoubleClick = onOpen)
             .pointerInput(app.packageName) {
                 awaitPointerEventScope {
                     while (true) {
@@ -1292,7 +1290,7 @@ private fun AppActionMenuItem(
     )
 }
 
-@OptIn(ExperimentalComposeUiApi::class)
+@OptIn(ExperimentalComposeUiApi::class, ExperimentalFoundationApi::class)
 @Composable
 private fun AppGridCard(
     app: AppInfo,
@@ -1320,7 +1318,7 @@ private fun AppGridCard(
                 if (isHovered) AppVisualTokens.Primary.copy(alpha = 0.45f) else AppVisualTokens.Border,
                 shape
             )
-            .pointerInput(app.packageName) { detectTapGestures(onDoubleTap = { onOpen() }) }
+
             .pointerInput(app.packageName) {
                 awaitPointerEventScope {
                     while (true) {
@@ -1335,7 +1333,7 @@ private fun AppGridCard(
                     }
                 }
             }
-            .clickable { onAction(AdbFunctionType.APP_INFO) }
+            .combinedClickable(onClick = { onAction(AdbFunctionType.APP_INFO) }, onDoubleClick = onOpen)
             .padding(UiTokens.SpaceMedium)
     ) {
         Column(

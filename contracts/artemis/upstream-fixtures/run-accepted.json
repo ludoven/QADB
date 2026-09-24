@@ -1,0 +1,14 @@
+{
+  "status": "queued",
+  "tasks": [
+    {
+      "session_id": "11111111-1111-1111-1111-111111111111",
+      "status": "queued",
+      "goal": "读取当前电量",
+      "device_serial": "emulator-5554",
+      "unexpected_future_field": true
+    }
+  ],
+  "enqueued_count": 1,
+  "total_queued": 1
+}

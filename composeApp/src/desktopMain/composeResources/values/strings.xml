@@ -780,6 +780,7 @@
     <string name="agent_public_result_unverified">未能验证</string>
     <string name="agent_public_result_failed">失败</string>
     <string name="agent_public_result_denied">已拒绝</string>
+    <string name="agent_failure_engine">Artemis 引擎连接失败，请重试。</string>
     <string name="agent_failure_protocol">模型返回了无法执行的格式，请重试。</string>
     <string name="agent_failure_network">网络连接失败，请检查网络后重试。</string>
     <string name="agent_failure_model_timeout">模型响应超过 30 秒。请重试；若持续发生，请检查 Provider 延迟或超时设置。</string>
