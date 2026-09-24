@@ -289,7 +289,7 @@ You can still switch to a custom ADB path in Settings when you need to use your 
 
 ### 5. Is Linux supported?
 
-Yes. The release workflow produces `.deb`, `.rpm`, and `.tar.gz` artifacts. Device mirroring still requires an available `scrcpy`; see the [download guide](./docs/download.md).
+Yes. The release workflow produces `.deb`, `.rpm`, and `.tar.gz` artifacts. Device mirroring still requires an available `scrcpy`; see the [download guide](./website/download.md).
 
 ---
 

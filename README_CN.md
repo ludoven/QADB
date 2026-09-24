@@ -292,7 +292,7 @@ QADB v2.0.5 起已内置 ADB，默认开箱即用，同时保留自定义 ADB �
 
 ### 5. 是否支持 Linux？
 
-支持。发布流程会生成 `.deb`、`.rpm` 和 `.tar.gz`；设备镜像仍依赖可用的 `scrcpy`，详见[下载说明](./docs/download.md)。
+支持。发布流程会生成 `.deb`、`.rpm` 和 `.tar.gz`；设备镜像仍依赖可用的 `scrcpy`，详见[下载说明](./website/download.md)。
 
 ---
 
