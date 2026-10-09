@@ -27,7 +27,9 @@ data class ArtemisApprovalMetadata(
     val deviceId: String,
     val taskVersion: Int,
     val expiresInMs: Long,
-    val pending: Boolean
+    val pending: Boolean,
+    val intent: String? = null,
+    val risk: String? = null
 )
 
 interface ArtemisBridge {
@@ -114,7 +116,9 @@ class QadbBridgeHttpClient(private val baseUrl: String, private val token: Strin
             deviceId = item["deviceId"]?.jsonPrimitive?.contentOrNull ?: return null,
             taskVersion = item["taskVersion"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: return null,
             expiresInMs = item["expiresInMs"]?.jsonPrimitive?.longOrNull ?: return null,
-            pending = item["pending"]?.jsonPrimitive?.booleanOrNull ?: return null
+            pending = item["pending"]?.jsonPrimitive?.booleanOrNull ?: return null,
+            intent = item["intent"]?.jsonPrimitive?.contentOrNull,
+            risk = item["risk"]?.jsonPrimitive?.contentOrNull
         )
     }
     override suspend fun decide(runId: String, approvalId: String, allowed: Boolean) { request(

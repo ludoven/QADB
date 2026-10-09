@@ -204,6 +204,8 @@ import com.ludoven.adbtool.agent.AgentPublicToolResult
 import com.ludoven.adbtool.agent.AgentPublicToolSummary
 import com.ludoven.adbtool.agent.AgentRunPhase
 import com.ludoven.adbtool.agent.AgentRunPresentation
+import com.ludoven.adbtool.agent.AgentTaskOutcome
+import com.ludoven.adbtool.agent.AgentVerificationLevel
 import com.ludoven.adbtool.agent.AgentSessionHistoryRecord
 import com.ludoven.adbtool.agent.AgentStep
 import com.ludoven.adbtool.agent.AgentTaskMode
@@ -388,7 +390,9 @@ fun AiAgentScreen(
                 if (selectedMode == AgentTaskMode.EXECUTE) showModelDialog = true else onOpenSettings()
                 return
             }
-            AgentReadiness.ENGINE_UNAVAILABLE -> {
+            AgentReadiness.ENGINE_UNAVAILABLE,
+            AgentReadiness.ARTEMIS_REQUIRED,
+            AgentReadiness.BRIDGE_REQUIRED -> {
                 onOpenSettings()
                 return
             }
@@ -960,6 +964,15 @@ private fun historyStatusLabel(record: AgentSessionHistoryRecord): String = when
     record.stopOutcome == AgentStopOutcome.UNCONFIRMED -> l10n("远端停止未确认", "Remote stop unconfirmed")
     record.finishedAtMs == null -> l10n("运行中断，未自动继续", "Interrupted; not resumed")
     record.needsUser -> l10n("需要接管", "Needs user")
+    record.outcome == AgentTaskOutcome.VERIFIED_SUCCESS -> when (record.verificationLevel) {
+        AgentVerificationLevel.DETERMINISTIC -> l10n("系统状态已验证完成", "System state verified")
+        AgentVerificationLevel.VISUAL -> l10n("根据画面确认完成", "Visual state verified")
+        AgentVerificationLevel.HUMAN_CONFIRMED -> l10n("人工已确认完成", "Human confirmed")
+        else -> l10n("已验证完成", "Verified success")
+    }
+    record.outcome == AgentTaskOutcome.ENGINE_FINISHED -> l10n("执行结束 · 结果待核实", "Finished · Outcome unverified")
+    record.outcome == AgentTaskOutcome.PARTIAL -> l10n("部分完成", "Partial")
+    record.outcome == AgentTaskOutcome.NEEDS_USER -> l10n("需要接管", "Needs user")
     record.phase == AgentRunPhase.COMPLETED -> l10n("结果待核实", "Outcome unverified")
     record.phase == AgentRunPhase.CANCELLED -> l10n("已停止", "Stopped")
     record.phase == AgentRunPhase.FAILED -> l10n("失败", "Failed")
@@ -1605,6 +1618,8 @@ private fun AgentOnboardingSteps(readiness: AgentReadiness) {
         AgentReadiness.DEVICE_REQUIRED -> 0
         AgentReadiness.MODEL_REQUIRED -> 1
         AgentReadiness.MODEL_TEST_REQUIRED,
+        AgentReadiness.ARTEMIS_REQUIRED,
+        AgentReadiness.BRIDGE_REQUIRED,
         AgentReadiness.ENGINE_UNAVAILABLE,
         AgentReadiness.CHECKING -> 2
         AgentReadiness.READY -> 3
@@ -2062,7 +2077,7 @@ private fun AgentActivityProgressCard(
     toolCards: List<ToolCallPresentation>,
     modifier: Modifier = Modifier
 ) {
-    val statusBadge = runStatusBadge(run.status)
+    val statusBadge = runStatusBadge(run)
     val steps = remember(run.runId, run.activities, toolCards) { timelineStepsFrom(run, toolCards) }
     val doneCount = steps.count {
         it.result == AgentPublicToolResult.SUCCEEDED || it.result == AgentPublicToolResult.RECOVERED
@@ -2838,7 +2853,9 @@ private fun AgentComposer(
                                 AgentReadiness.DEVICE_REQUIRED -> onOpenDevices
                                 AgentReadiness.MODEL_REQUIRED -> onOpenSettings
                                 AgentReadiness.MODEL_TEST_REQUIRED -> onOpenSettings
-                                AgentReadiness.ENGINE_UNAVAILABLE -> onOpenEngineSettings
+                                AgentReadiness.ENGINE_UNAVAILABLE,
+                                AgentReadiness.ARTEMIS_REQUIRED,
+                                AgentReadiness.BRIDGE_REQUIRED -> onOpenEngineSettings
                                 AgentReadiness.READY -> onSend
                                 AgentReadiness.CHECKING -> ({})
                             }
@@ -2847,6 +2864,8 @@ private fun AgentComposer(
                                 AgentReadiness.DEVICE_REQUIRED -> l10n("连接设备", "Connect device")
                                 AgentReadiness.MODEL_REQUIRED -> l10n("配置模型", "Configure model")
                                 AgentReadiness.MODEL_TEST_REQUIRED -> l10n("测试模型", "Test model")
+                                AgentReadiness.ARTEMIS_REQUIRED -> l10n("Artemis 未就绪", "Artemis unavailable")
+                                AgentReadiness.BRIDGE_REQUIRED -> l10n("Bridge 未就绪", "Bridge unavailable")
                                 AgentReadiness.ENGINE_UNAVAILABLE -> l10n("引擎未就绪", "Engine unavailable")
                                 AgentReadiness.READY -> when {
                                     linkedContinuation -> l10n("发送新执行段", "Start new segment")
@@ -3427,9 +3446,70 @@ private fun AgentActionButton(
 // ============ Copy mapping and formatting ============
 
 @Composable
+private fun runStatusBadge(run: AgentRunPresentation): BadgeSpec = when (run.status) {
+    AgentPublicRunStatus.COMPLETED -> when (run.verification.level) {
+        AgentVerificationLevel.DETERMINISTIC -> BadgeSpec(
+            l10n("系统状态已验证完成", "System state verified"),
+            QadbTokens.successContainer,
+            QadbTokens.successText
+        )
+        AgentVerificationLevel.VISUAL -> BadgeSpec(
+            l10n("根据当前画面确认完成", "Visual state verified"),
+            QadbTokens.successContainer,
+            QadbTokens.successText
+        )
+        AgentVerificationLevel.HUMAN_CONFIRMED -> BadgeSpec(
+            l10n("人工已确认完成", "Human confirmed"),
+            QadbTokens.successContainer,
+            QadbTokens.successText
+        )
+        else -> BadgeSpec(
+            stringResource(Res.string.agent_badge_completed),
+            QadbTokens.successContainer,
+            QadbTokens.successText
+        )
+    }
+    AgentPublicRunStatus.ENGINE_FINISHED -> BadgeSpec(
+        l10n("执行结束 · 结果待核实", "Finished · Outcome unverified"),
+        QadbTokens.warningContainer,
+        QadbTokens.warningText
+    )
+    AgentPublicRunStatus.FAILED -> BadgeSpec(
+        stringResource(Res.string.agent_badge_failed),
+        QadbTokens.dangerContainer,
+        QadbTokens.dangerText
+    )
+    AgentPublicRunStatus.CANCELLED -> BadgeSpec(
+        stringResource(Res.string.agent_badge_cancelled),
+        QadbTokens.bg3,
+        QadbTokens.textTertiary
+    )
+    AgentPublicRunStatus.WAITING_CONFIRMATION -> BadgeSpec(
+        stringResource(Res.string.agent_badge_waiting),
+        QadbTokens.warningContainer,
+        QadbTokens.warningText
+    )
+    AgentPublicRunStatus.CANCELLING -> BadgeSpec(
+        l10n("停止中", "Stopping"),
+        QadbTokens.infoContainer,
+        QadbTokens.infoText
+    )
+    AgentPublicRunStatus.RUNNING -> BadgeSpec(
+        stringResource(Res.string.agent_badge_in_progress),
+        QadbTokens.infoContainer,
+        QadbTokens.infoText
+    )
+}
+
+@Composable
 private fun runStatusBadge(status: AgentPublicRunStatus): BadgeSpec = when (status) {
     AgentPublicRunStatus.COMPLETED -> BadgeSpec(
-        l10n("结果待核实", "Outcome unverified"),
+        stringResource(Res.string.agent_badge_completed),
+        QadbTokens.successContainer,
+        QadbTokens.successText
+    )
+    AgentPublicRunStatus.ENGINE_FINISHED -> BadgeSpec(
+        l10n("执行结束 · 结果待核实", "Finished · Outcome unverified"),
         QadbTokens.warningContainer,
         QadbTokens.warningText
     )

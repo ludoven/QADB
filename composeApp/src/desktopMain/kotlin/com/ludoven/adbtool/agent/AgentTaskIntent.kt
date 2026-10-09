@@ -19,7 +19,7 @@ enum class AgentTaskAccessLevel {
     MUTATING
 }
 
-enum class AgentTaskOutcome { READ_ONLY, DEVICE_CHANGE }
+enum class AgentTaskAuthorityOutcome { READ_ONLY, DEVICE_CHANGE }
 
 enum class AgentActionEffect {
     OBSERVE,
@@ -35,19 +35,19 @@ enum class AgentActionEffect {
 }
 
 data class AgentTaskAuthority(
-    val outcome: AgentTaskOutcome,
+    val outcome: AgentTaskAuthorityOutcome,
     val allowedEffects: Set<AgentActionEffect>
 ) {
     fun allows(effect: AgentActionEffect): Boolean = effect in allowedEffects
 
     companion object {
-        val NONE = AgentTaskAuthority(AgentTaskOutcome.READ_ONLY, emptySet())
+        val NONE = AgentTaskAuthority(AgentTaskAuthorityOutcome.READ_ONLY, emptySet())
         val OBSERVE_ONLY = AgentTaskAuthority(
-            AgentTaskOutcome.READ_ONLY,
+            AgentTaskAuthorityOutcome.READ_ONLY,
             setOf(AgentActionEffect.OBSERVE)
         )
         val NAVIGATION_READ_ONLY = AgentTaskAuthority(
-            AgentTaskOutcome.READ_ONLY,
+            AgentTaskAuthorityOutcome.READ_ONLY,
             setOf(
                 AgentActionEffect.OBSERVE,
                 AgentActionEffect.LAUNCH_APP,
@@ -57,7 +57,7 @@ data class AgentTaskAuthority(
             )
         )
         val DEVICE_OPERATION = AgentTaskAuthority(
-            AgentTaskOutcome.DEVICE_CHANGE,
+            AgentTaskAuthorityOutcome.DEVICE_CHANGE,
             AgentActionEffect.entries.toSet()
         )
 

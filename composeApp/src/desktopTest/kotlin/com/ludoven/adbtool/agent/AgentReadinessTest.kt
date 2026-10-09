@@ -87,4 +87,36 @@ class AgentReadinessTest {
             )
         )
     }
+
+    @Test
+    fun `artemis daemon failure is distinguished from bridge or model failure`() {
+        assertEquals(
+            AgentReadiness.ARTEMIS_REQUIRED,
+            resolveAgentReadiness(
+                deviceConnected = true,
+                configurationChecked = true,
+                modelConfigured = true,
+                executionReady = false,
+                externalEngineSelected = true,
+                artemisDaemonReady = false,
+                bridgeReady = true
+            )
+        )
+    }
+
+    @Test
+    fun `bridge failure is distinguished from artemis daemon failure`() {
+        assertEquals(
+            AgentReadiness.BRIDGE_REQUIRED,
+            resolveAgentReadiness(
+                deviceConnected = true,
+                configurationChecked = true,
+                modelConfigured = true,
+                executionReady = false,
+                externalEngineSelected = true,
+                artemisDaemonReady = true,
+                bridgeReady = false
+            )
+        )
+    }
 }

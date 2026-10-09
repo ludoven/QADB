@@ -51,3 +51,18 @@ class ArtemisTraceRetention(
         }
     }
 }
+
+fun ArtemisEvidenceSource.toAgentEvidenceSource(): com.ludoven.adbtool.agent.AgentEvidenceSource = when (this) {
+    ArtemisEvidenceSource.NONE -> com.ludoven.adbtool.agent.AgentEvidenceSource.NONE
+    ArtemisEvidenceSource.SYSTEM_PROBE -> com.ludoven.adbtool.agent.AgentEvidenceSource.SYSTEM_PROBE
+    ArtemisEvidenceSource.ARTEMIS_CHECKER -> com.ludoven.adbtool.agent.AgentEvidenceSource.ARTEMIS_CHECKER
+    ArtemisEvidenceSource.VISUAL_REVIEW -> com.ludoven.adbtool.agent.AgentEvidenceSource.VISUAL_REVIEW
+    ArtemisEvidenceSource.HUMAN_CONFIRMED -> com.ludoven.adbtool.agent.AgentEvidenceSource.HUMAN_CONFIRMED
+}
+
+fun ArtemisVerificationVerdict.toAgentVerificationVerdict(): com.ludoven.adbtool.agent.AgentVerificationVerdict = when (this) {
+    ArtemisVerificationVerdict.UNVERIFIED -> com.ludoven.adbtool.agent.AgentVerificationVerdict.UNVERIFIED
+    ArtemisVerificationVerdict.VERIFIED -> com.ludoven.adbtool.agent.AgentVerificationVerdict.VERIFIED
+    ArtemisVerificationVerdict.FAILED -> com.ludoven.adbtool.agent.AgentVerificationVerdict.FAILED
+    ArtemisVerificationVerdict.UNKNOWN -> com.ludoven.adbtool.agent.AgentVerificationVerdict.UNKNOWN
+}

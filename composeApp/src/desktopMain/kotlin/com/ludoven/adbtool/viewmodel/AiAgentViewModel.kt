@@ -95,10 +95,11 @@ class AiAgentViewModel(
     private val configRepository: AiConfigRepository = AiConfiguration.repository,
     deviceGateway: AgentDeviceGateway = RealAgentDeviceGateway(),
     agentTaskRunner: AgentTaskRunner = SelectableAgentTaskRunner(
-        ScreenshotAgentEngine(
+        screenshotRunner = ScreenshotAgentEngine(
             model = RoutedScreenshotAgentGateway(),
             deviceGateway = deviceGateway
-        )
+        ),
+        deviceGateway = deviceGateway
     ),
     private val providerRepository: AgentProviderRepository = AgentProviderRuntime.repository,
     private val deviceLeaseManager: DeviceLeaseManager = DeviceLeaseRuntime.manager,
@@ -262,6 +263,25 @@ class AiAgentViewModel(
         val acceptedAtMs = System.currentTimeMillis()
         val executionDeviceId = if (mode == AgentTaskMode.EXECUTE || readDeviceEvidence) selectedDeviceId.orEmpty() else ""
         val runId = UUID.randomUUID().toString()
+        val resolvedConversationId = if (parentRunId != null) {
+            val parent = runCatching { sessionHistoryStore.find(parentRunId) }.getOrNull()
+            parent?.conversationId ?: parent?.parentRunId ?: parentRunId
+        } else {
+            UUID.randomUUID().toString()
+        }
+
+        val effectiveTask = if (parentRunId != null) {
+            val parent = runCatching { sessionHistoryStore.find(parentRunId) }.getOrNull()
+            if (parent != null) {
+                val projection = com.ludoven.adbtool.agent.AgentConversationContext(
+                    conversationId = resolvedConversationId,
+                    rootGoal = parent.title,
+                    confirmedFacts = listOfNotNull(parent.outcome.name.takeIf { it.isNotBlank() })
+                )
+                projection.toAugmentedGoal(task)
+            } else task
+        } else task
+
         val taskJob = publicStateSynchronizer.serialized {
             if (_state.value.isRunning) return@serialized null
             // Every send is a new run. A linked continuation retains only its
@@ -302,6 +322,7 @@ class AiAgentViewModel(
                 deviceEvidenceAuthorized = readDeviceEvidence,
                 needsUser = false,
                 boundDeviceId = executionDeviceId.takeIf(String::isNotBlank),
+                conversationId = resolvedConversationId,
                 pendingConfirmation = null,
                 errorMessage = null,
                 failure = null,
@@ -321,7 +342,7 @@ class AiAgentViewModel(
             val runHandle = taskRunHandles.begin(runId, adapter, firstFeedbackMs, executionDeviceId)
             viewModelScope.launch(Dispatchers.IO, start = CoroutineStart.LAZY) {
                 executeTask(
-                    task = task,
+                    task = effectiveTask,
                     executionDeviceId = executionDeviceId,
                     initialState = acceptedState,
                     runHandle = runHandle,
@@ -359,7 +380,14 @@ class AiAgentViewModel(
     ) {
         try {
             runCatching {
-                sessionHistoryStore.start(runHandle.runId, task, executionDeviceId, acceptedAtMs, parentRunId)
+                sessionHistoryStore.start(
+                    runHandle.runId,
+                    task,
+                    executionDeviceId,
+                    acceptedAtMs,
+                    parentRunId,
+                    initialState.conversationId
+                )
             }.onFailure { System.err.println("Agent history start failed: ${it::class.simpleName}") }
             val terminalState = agentTaskRunner.run(
                 task = task,
@@ -992,7 +1020,7 @@ internal class AgentOrchestratorPublicEventAdapter(
                 events += next(AgentPublicEventPayload.Cancelled)
             }
             snapshot.phase == AgentRunPhase.COMPLETED && previous.phase != AgentRunPhase.COMPLETED -> {
-                events += next(AgentPublicEventPayload.Completed)
+                events += next(AgentPublicEventPayload.Completed(snapshot.outcome, snapshot.verification))
             }
         }
         previous = snapshot

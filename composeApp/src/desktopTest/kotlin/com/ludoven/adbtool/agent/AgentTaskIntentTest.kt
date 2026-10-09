@@ -88,7 +88,7 @@ class AgentTaskIntentTest {
             assertEquals(AgentTaskIntentKind.APP_CONTENT_READ, intent.kind, task)
             assertEquals(AgentTaskAccessLevel.NAVIGATION_READ_ONLY, intent.accessLevel, task)
             assertFalse(intent.hasExplicitMutation, task)
-            assertEquals(AgentTaskOutcome.READ_ONLY, intent.authority.outcome, task)
+            assertEquals(AgentTaskAuthorityOutcome.READ_ONLY, intent.authority.outcome, task)
             assertTrue(intent.authority.allows(AgentActionEffect.LAUNCH_APP), task)
             assertTrue(intent.authority.allows(AgentActionEffect.NAVIGATION), task)
             assertTrue(intent.authority.allows(AgentActionEffect.SCROLL), task)

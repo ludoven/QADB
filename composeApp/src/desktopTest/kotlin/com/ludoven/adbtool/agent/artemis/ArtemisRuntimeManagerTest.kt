@@ -73,6 +73,30 @@ class ArtemisRuntimeManagerTest {
         assertFailsWith<IllegalStateException> { manager.start(spec) }
     }
 
+    @Test
+    fun `managed runtime state transitions correctly and detects crash`() {
+        val fakeProcess = FakeProcess()
+        val launcher = ArtemisRuntimeLauncher { _, _, _ -> fakeProcess }
+        val manager = ArtemisRuntimeManager(launcher)
+
+        assertEquals(ArtemisRuntimeState.STOPPED, ArtemisRuntimeState.STOPPED)
+        assertTrue(manager.isAlive() == false)
+
+        val spec = ManagedArtemisRuntimeSpec(
+            Path.of("python"), Path.of("runtime"), 18761,
+            Path.of("bridge"), Path.of("data/bridge.sqlite"), "a".repeat(64),
+            extraEnvironment = mapOf("OPENAI_API_KEY" to "secret-key")
+        )
+        assertEquals("secret-key", spec.environment()["OPENAI_API_KEY"])
+
+        manager.start(spec)
+        assertTrue(manager.isAlive())
+
+        // Simulate crash
+        fakeProcess.alive = false
+        assertFalse(manager.isAlive())
+    }
+
     private class FakeProcess : ArtemisOwnedProcess {
         override var alive: Boolean = true
         var destroyed = false

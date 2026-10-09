@@ -30,7 +30,22 @@ sealed interface AgentPublicEventPayload {
     data class Failed(val failure: AgentFailure) : AgentPublicEventPayload
     data object Cancelling : AgentPublicEventPayload
     data object Cancelled : AgentPublicEventPayload
-    data object Completed : AgentPublicEventPayload
+    sealed interface Completed : AgentPublicEventPayload {
+        val outcome: AgentTaskOutcome get() = AgentTaskOutcome.VERIFIED_SUCCESS
+        val verification: AgentVerificationState get() = AgentVerificationState()
+
+        companion object : Completed {
+            operator fun invoke(
+                outcome: AgentTaskOutcome = AgentTaskOutcome.VERIFIED_SUCCESS,
+                verification: AgentVerificationState = AgentVerificationState()
+            ): Completed = Detailed(outcome, verification)
+        }
+
+        data class Detailed(
+            override val outcome: AgentTaskOutcome,
+            override val verification: AgentVerificationState
+        ) : Completed
+    }
 }
 
 enum class AgentPublicStage {
@@ -53,11 +68,12 @@ enum class AgentPublicRunStatus {
     WAITING_CONFIRMATION,
     CANCELLING,
     COMPLETED,
+    ENGINE_FINISHED,
     FAILED,
     CANCELLED;
 
     val isTerminal: Boolean
-        get() = this == COMPLETED || this == FAILED || this == CANCELLED
+        get() = this == COMPLETED || this == ENGINE_FINISHED || this == FAILED || this == CANCELLED
 }
 
 enum class AgentPublicToolKind {
@@ -196,6 +212,8 @@ data class AgentRunPresentation(
     val finishedAtMs: Long? = null,
     val stage: AgentPublicStage = AgentPublicStage.UNDERSTANDING,
     val status: AgentPublicRunStatus = AgentPublicRunStatus.RUNNING,
+    val outcome: AgentTaskOutcome = AgentTaskOutcome.RUNNING,
+    val verification: AgentVerificationState = AgentVerificationState(),
     val activities: List<AgentPublicActivityItem> = emptyList(),
     val latestTool: AgentPublicToolSummary? = null,
     val responseText: String = "",
@@ -322,14 +340,26 @@ object AgentPublicActivityReducer {
                 status = AgentPublicRunStatus.CANCELLED,
                 preferredExpanded = false
             )
-            AgentPublicEventPayload.Completed -> current.withStageEvent(
-                event,
-                AgentPublicStage.COMPLETED
-            ).copy(
-                finishedAtMs = event.occurredAtMs,
-                status = AgentPublicRunStatus.COMPLETED,
-                preferredExpanded = false
-            )
+            is AgentPublicEventPayload.Completed -> {
+                val stage = when (payload.outcome) {
+                    AgentTaskOutcome.FAILED -> AgentPublicStage.FAILED
+                    AgentTaskOutcome.CANCELLED -> AgentPublicStage.CANCELLED
+                    else -> AgentPublicStage.COMPLETED
+                }
+                val status = when (payload.outcome) {
+                    AgentTaskOutcome.FAILED -> AgentPublicRunStatus.FAILED
+                    AgentTaskOutcome.CANCELLED -> AgentPublicRunStatus.CANCELLED
+                    AgentTaskOutcome.ENGINE_FINISHED -> AgentPublicRunStatus.ENGINE_FINISHED
+                    else -> AgentPublicRunStatus.COMPLETED
+                }
+                current.withStageEvent(event, stage).copy(
+                    finishedAtMs = event.occurredAtMs,
+                    status = status,
+                    outcome = payload.outcome,
+                    verification = payload.verification,
+                    preferredExpanded = false
+                )
+            }
             AgentPublicEventPayload.RunStarted -> current
         }
 

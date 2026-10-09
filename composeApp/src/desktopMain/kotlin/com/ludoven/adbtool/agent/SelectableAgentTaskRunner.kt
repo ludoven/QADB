@@ -15,7 +15,8 @@ import kotlinx.coroutines.delay
 class SelectableAgentTaskRunner(
     private val screenshotRunner: AgentTaskRunner,
     private val artemisSettings: ArtemisEnginePreferences = ArtemisEngineRuntime.preferences,
-    private val advisoryRunner: AgentTaskRunner = AdvisoryAgentRunner()
+    private val advisoryRunner: AgentTaskRunner = AdvisoryAgentRunner(),
+    private val deviceGateway: AgentDeviceGateway? = null
 ) : CancellableAgentTaskRunner, AgentTaskRunnerReadiness, AgentTaskRunnerRecovery {
     private val active = ConcurrentHashMap<String, CancellableAgentTaskRunner>()
 
@@ -97,15 +98,26 @@ class SelectableAgentTaskRunner(
         return awaitAgentRunnerReadiness { candidate.readiness() }
     }
 
-    private fun createArtemisCandidate(configuration: ArtemisEngineConfiguration): ArtemisCandidate {
-        val connection = ArtemisEngineRuntime.managedRuntime.requireConnection(configuration.baseUrl)
+    private suspend fun createArtemisCandidate(configuration: ArtemisEngineConfiguration): ArtemisCandidate {
+        val modelConfig = AiConfiguration.repository.config.value
+        val apiKey = AiConfiguration.repository.loadApiKey()
+        val providerType = com.ludoven.adbtool.agent.artemis.ArtemisProviderProjection.inferProviderType(modelConfig.baseUrl, modelConfig.model)
+        val unifiedProfile = com.ludoven.adbtool.agent.artemis.UnifiedModelProfile(
+            provider = providerType,
+            baseUrl = modelConfig.baseUrl,
+            apiKey = apiKey,
+            model = modelConfig.model
+        )
+        val injectedEnv = com.ludoven.adbtool.agent.artemis.ArtemisProviderProjection.project(unifiedProfile)
+        val connection = ArtemisEngineRuntime.managedRuntime.requireConnection(configuration.baseUrl, extraEnvironment = injectedEnv)
         val client = ArtemisHttpClient(connection.baseUrl)
         val bridge = QadbBridgeHttpClient(connection.baseUrl, connection.bridgeToken)
         return ArtemisCandidate(
             runner = ArtemisAgentEngine(
                 client = client,
                 profile = configuration.profile,
-                bridge = bridge
+                bridge = bridge,
+                deviceGateway = deviceGateway
             ),
             readiness = {
                 val readiness = client.getReadiness()

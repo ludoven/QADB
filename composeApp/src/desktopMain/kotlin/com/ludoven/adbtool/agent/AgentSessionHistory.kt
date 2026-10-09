@@ -16,6 +16,7 @@ import kotlinx.serialization.json.put
 data class AgentSessionHistoryRecord(
     val runId: String,
     val parentRunId: String? = null,
+    val conversationId: String? = null,
     val title: String,
     val deviceId: String,
     val startedAtMs: Long,
@@ -23,11 +24,20 @@ data class AgentSessionHistoryRecord(
     val phase: AgentRunPhase,
     val stopOutcome: AgentStopOutcome,
     val needsUser: Boolean,
-    val activities: List<AgentPublicActivityItem>
+    val activities: List<AgentPublicActivityItem>,
+    val outcome: AgentTaskOutcome = AgentTaskOutcome.OUTCOME_UNKNOWN,
+    val verificationLevel: AgentVerificationLevel = AgentVerificationLevel.NONE
 )
 
 interface AgentSessionHistoryStore {
-    fun start(runId: String, task: String, deviceId: String, startedAtMs: Long, parentRunId: String? = null)
+    fun start(
+        runId: String,
+        task: String,
+        deviceId: String,
+        startedAtMs: Long,
+        parentRunId: String? = null,
+        conversationId: String? = null
+    )
     fun finish(runId: String, state: AgentTaskUiState)
     fun confirmStop(runId: String)
     /** Deletes only a settled leaf record; audit tables and device evidence are separate. */
@@ -37,7 +47,14 @@ interface AgentSessionHistoryStore {
 }
 
 object NoopAgentSessionHistoryStore : AgentSessionHistoryStore {
-    override fun start(runId: String, task: String, deviceId: String, startedAtMs: Long, parentRunId: String?) = Unit
+    override fun start(
+        runId: String,
+        task: String,
+        deviceId: String,
+        startedAtMs: Long,
+        parentRunId: String?,
+        conversationId: String?
+    ) = Unit
     override fun finish(runId: String, state: AgentTaskUiState) = Unit
     override fun confirmStop(runId: String) = Unit
     override fun deleteFinished(runId: String): Boolean = false
@@ -72,11 +89,21 @@ class SqliteAgentSessionHistoryStore(
                     public_activities TEXT NOT NULL
                 )"""
             )
-            val hasParent = statement.executeQuery("PRAGMA table_info(agent_session_history)").use { columns ->
-                generateSequence { if (columns.next()) columns.getString("name") else null }
-                    .any { it == "parent_run_id" }
+            val columnNames = statement.executeQuery("PRAGMA table_info(agent_session_history)").use { columns ->
+                generateSequence { if (columns.next()) columns.getString("name") else null }.toSet()
             }
-            if (!hasParent) statement.execute("ALTER TABLE agent_session_history ADD COLUMN parent_run_id TEXT")
+            if ("parent_run_id" !in columnNames) {
+                statement.execute("ALTER TABLE agent_session_history ADD COLUMN parent_run_id TEXT")
+            }
+            if ("conversation_id" !in columnNames) {
+                statement.execute("ALTER TABLE agent_session_history ADD COLUMN conversation_id TEXT")
+            }
+            if ("outcome" !in columnNames) {
+                statement.execute("ALTER TABLE agent_session_history ADD COLUMN outcome TEXT")
+            }
+            if ("verification_level" !in columnNames) {
+                statement.execute("ALTER TABLE agent_session_history ADD COLUMN verification_level TEXT")
+            }
             statement.execute(
                 "CREATE INDEX IF NOT EXISTS agent_session_history_started_idx " +
                     "ON agent_session_history(started_at DESC)"
@@ -85,13 +112,20 @@ class SqliteAgentSessionHistoryStore(
     }
 
     @Synchronized
-    override fun start(runId: String, task: String, deviceId: String, startedAtMs: Long, parentRunId: String?) {
+    override fun start(
+        runId: String,
+        task: String,
+        deviceId: String,
+        startedAtMs: Long,
+        parentRunId: String?,
+        conversationId: String?
+    ) {
         val title = task.lineSequence().firstOrNull().orEmpty().trim().take(100)
             .ifBlank { "Agent task" }
         connection.prepareStatement(
             """INSERT OR IGNORE INTO agent_session_history
                 (run_id, format_version, title, device_id, started_at, phase, stop_outcome,
-                 needs_user, public_activities, parent_run_id) VALUES (?, 2, ?, ?, ?, ?, ?, 0, '[]', ?)"""
+                 needs_user, public_activities, parent_run_id, conversation_id) VALUES (?, 2, ?, ?, ?, ?, ?, 0, '[]', ?, ?)"""
         ).use { statement ->
             statement.setString(1, runId)
             statement.setString(2, title)
@@ -100,6 +134,7 @@ class SqliteAgentSessionHistoryStore(
             statement.setString(5, AgentRunPhase.OBSERVING.name)
             statement.setString(6, AgentStopOutcome.NONE.name)
             statement.setString(7, parentRunId)
+            statement.setString(8, conversationId)
             statement.executeUpdate()
         }
     }
@@ -120,14 +155,16 @@ class SqliteAgentSessionHistoryStore(
         }.toString()
         connection.prepareStatement(
             """UPDATE agent_session_history SET finished_at = ?, phase = ?, stop_outcome = ?,
-                needs_user = ?, public_activities = ? WHERE run_id = ?"""
+                needs_user = ?, public_activities = ?, outcome = ?, verification_level = ? WHERE run_id = ?"""
         ).use { statement ->
             statement.setLong(1, System.currentTimeMillis())
             statement.setString(2, state.phase.name)
             statement.setString(3, state.stopOutcome.name)
             statement.setInt(4, if (state.needsUser) 1 else 0)
             statement.setString(5, encoded)
-            statement.setString(6, runId)
+            statement.setString(6, state.outcome.name)
+            statement.setString(7, state.verification.level.name)
+            statement.setString(8, runId)
             statement.executeUpdate()
         }
     }
@@ -162,7 +199,7 @@ class SqliteAgentSessionHistoryStore(
     @Synchronized
     override fun recent(): List<AgentSessionHistoryRecord> = connection.prepareStatement(
         """SELECT run_id, format_version, title, device_id, started_at, finished_at, phase,
-            stop_outcome, needs_user, public_activities, parent_run_id FROM agent_session_history
+            stop_outcome, needs_user, public_activities, parent_run_id, outcome, verification_level, conversation_id FROM agent_session_history
             ORDER BY started_at DESC LIMIT 80"""
     ).use { statement ->
         statement.executeQuery().use { rows ->
@@ -177,7 +214,7 @@ class SqliteAgentSessionHistoryStore(
     @Synchronized
     override fun find(runId: String): AgentSessionHistoryRecord? = connection.prepareStatement(
         """SELECT run_id, format_version, title, device_id, started_at, finished_at, phase,
-            stop_outcome, needs_user, public_activities, parent_run_id FROM agent_session_history
+            stop_outcome, needs_user, public_activities, parent_run_id, outcome, verification_level, conversation_id FROM agent_session_history
             WHERE run_id = ?"""
     ).use { statement ->
         statement.setString(1, runId)
@@ -190,6 +227,7 @@ class SqliteAgentSessionHistoryStore(
         return AgentSessionHistoryRecord(
             runId = rows.getString("run_id"),
             parentRunId = if (version >= 2) rows.getString("parent_run_id") else null,
+            conversationId = rows.getString("conversation_id"),
             title = rows.getString("title"),
             deviceId = rows.getString("device_id"),
             startedAtMs = rows.getLong("started_at"),
@@ -197,7 +235,13 @@ class SqliteAgentSessionHistoryStore(
             phase = enumValueOrDefault(rows.getString("phase"), AgentRunPhase.IDLE),
             stopOutcome = enumValueOrDefault(rows.getString("stop_outcome"), AgentStopOutcome.NONE),
             needsUser = rows.getInt("needs_user") != 0,
-            activities = decodeActivities(rows.getString("public_activities"))
+            activities = decodeActivities(rows.getString("public_activities")),
+            outcome = rows.getString("outcome")?.let { raw ->
+                runCatching { AgentTaskOutcome.valueOf(raw) }.getOrNull()
+            } ?: AgentTaskOutcome.OUTCOME_UNKNOWN,
+            verificationLevel = rows.getString("verification_level")?.let { raw ->
+                runCatching { AgentVerificationLevel.valueOf(raw) }.getOrNull()
+            } ?: AgentVerificationLevel.NONE
         )
     }
 

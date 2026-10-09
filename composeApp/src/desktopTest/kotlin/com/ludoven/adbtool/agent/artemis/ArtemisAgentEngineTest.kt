@@ -4,6 +4,10 @@ import com.ludoven.adbtool.agent.AgentRunPhase
 import com.ludoven.adbtool.agent.AgentAction
 import com.ludoven.adbtool.agent.AgentExecutionStrategy
 import com.ludoven.adbtool.agent.AgentStepStatus
+import com.ludoven.adbtool.agent.AgentTaskOutcome
+import com.ludoven.adbtool.agent.AgentVerificationLevel
+import com.ludoven.adbtool.agent.AgentVerificationVerdict
+import com.ludoven.adbtool.agent.AgentEvidenceSource
 import com.ludoven.adbtool.agent.AgentTaskUiState
 import java.util.ArrayDeque
 import kotlin.test.Test
@@ -36,10 +40,60 @@ class ArtemisAgentEngineTest {
 
         assertFalse(result.isRunning)
         assertEquals(AgentRunPhase.COMPLETED, result.phase)
+        assertEquals(AgentTaskOutcome.ENGINE_FINISHED, result.outcome)
+        assertEquals(AgentVerificationLevel.ENGINE_REPORTED, result.verification.level)
         assertEquals(AgentExecutionStrategy.SEMANTIC_V2, states.first().executionStrategy)
         assertTrue(result.messages.last().text.contains("读取到 73%"))
         assertTrue(result.messages.last().text.contains("尚未独立核实"))
-        assertEquals(listOf("POST", "GET"), service.requests.map { it.method })
+        assertEquals(listOf("POST", "GET", "GET"), service.requests.map { it.method })
+        assertEquals(160, result.usage.totalTokens)
+        assertEquals(2, result.budgetStatus.modelCalls)
+    }
+
+    @Test
+    fun `completed external task with checker evidence promotes to verified success`(): Unit = runBlocking {
+        val service = FakeTransport(
+            responses = listOf(
+                json("""{"status":"queued","tasks":[{"session_id":"$RUN","status":"queued"}],"enqueued_count":1}"""),
+                json("""{"session_id":"$RUN","status":"completed","summary":"已进入目标页面 (Checker: verified)"}""")
+            )
+        )
+        val result = ArtemisAgentEngine(
+            ArtemisHttpClient(BASE_URL, service),
+            ArtemisProfile.PRO,
+            FakeBridge(),
+            registry = InMemoryRegistry(),
+            pollIntervalMs = 100
+        ).run("打开目标", "emulator-5554", AgentTaskUiState(), RUN)
+
+        assertFalse(result.isRunning)
+        assertEquals(AgentRunPhase.COMPLETED, result.phase)
+        assertEquals(AgentTaskOutcome.VERIFIED_SUCCESS, result.outcome)
+        assertEquals(AgentVerificationLevel.VISUAL, result.verification.level)
+        assertEquals(AgentVerificationVerdict.VERIFIED, result.verification.verdict)
+        assertEquals(AgentEvidenceSource.ARTEMIS_CHECKER, result.verification.source)
+    }
+
+    @Test
+    fun `runtime disconnect or crash marks outcome as OUTCOME_UNKNOWN`(): Unit = runBlocking {
+        val service = FakeTransport(
+            responses = listOf(
+                json("""{"status":"queued","tasks":[{"session_id":"$RUN","status":"queued"}],"enqueued_count":1}"""),
+                ArtemisHttpResponse(500, """{"error":"Runtime connection reset by peer"}""")
+            )
+        )
+        val result = ArtemisAgentEngine(
+            ArtemisHttpClient(BASE_URL, service),
+            ArtemisProfile.FLASH,
+            FakeBridge(),
+            registry = InMemoryRegistry(),
+            pollIntervalMs = 100
+        ).run("测试崩溃拦截", "emulator-5554", AgentTaskUiState(), RUN)
+
+        assertFalse(result.isRunning)
+        assertEquals(AgentRunPhase.FAILED, result.phase)
+        assertEquals(AgentTaskOutcome.OUTCOME_UNKNOWN, result.outcome)
+        assertEquals(AgentVerificationVerdict.UNKNOWN, result.verification.verdict)
     }
 
     @Test
@@ -211,6 +265,9 @@ class ArtemisAgentEngineTest {
 
         override suspend fun execute(request: ArtemisHttpRequest): ArtemisHttpResponse {
             requests += request
+            if (request.path.endsWith("/usage")) {
+                return ArtemisHttpResponse(200, """{"llm_calls":2,"prompt_tokens":120,"completion_tokens":40,"total_tokens":160}""")
+            }
             return queued.removeFirst()
         }
     }

@@ -204,11 +204,14 @@ data class AgentTaskUiState(
     /** Terminal handoff: execution stopped safely and requires an explicit new user turn to continue. */
     val needsUser: Boolean = false,
     val boundDeviceId: String? = null,
+    val conversationId: String? = null,
     val pendingConfirmation: AgentStep? = null,
     val observationMode: AgentObservationMode = AgentObservationMode.VISION,
     val errorMessage: String? = null,
     val failure: AgentFailure? = null,
     val phase: AgentRunPhase = AgentRunPhase.IDLE,
+    val outcome: AgentTaskOutcome = AgentTaskOutcome.RUNNING,
+    val verification: AgentVerificationState = AgentVerificationState(),
     val usage: AgentUsage = AgentUsage(),
     /** Per-request input usage, when the provider reports it. Cumulative usage is [usage]. */
     val lastRequestUsage: AgentUsage? = null,

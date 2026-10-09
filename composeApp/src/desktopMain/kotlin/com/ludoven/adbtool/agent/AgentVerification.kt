@@ -1,5 +1,51 @@
 package com.ludoven.adbtool.agent
 
+enum class AgentTaskOutcome {
+    RUNNING,
+    ENGINE_FINISHED,
+    VERIFIED_SUCCESS,
+    PARTIAL,
+    NEEDS_USER,
+    FAILED,
+    CANCELLED,
+    OUTCOME_UNKNOWN;
+
+    val isTerminal: Boolean
+        get() = this != RUNNING
+}
+
+enum class AgentVerificationLevel {
+    NONE,
+    ENGINE_REPORTED,
+    VISUAL,
+    DETERMINISTIC,
+    HUMAN_CONFIRMED
+}
+
+enum class AgentVerificationVerdict {
+    UNVERIFIED,
+    VERIFIED,
+    FAILED,
+    UNKNOWN
+}
+
+enum class AgentEvidenceSource {
+    NONE,
+    SYSTEM_PROBE,
+    DETERMINISTIC_PREDICATE,
+    ARTEMIS_CHECKER,
+    VISUAL_REVIEW,
+    HUMAN_CONFIRMED
+}
+
+data class AgentVerificationState(
+    val verdict: AgentVerificationVerdict = AgentVerificationVerdict.UNVERIFIED,
+    val level: AgentVerificationLevel = AgentVerificationLevel.NONE,
+    val source: AgentEvidenceSource? = null,
+    val evidenceIds: List<String> = emptyList(),
+    val summary: String? = null
+)
+
 data class AgentPredicateResult(
     val matches: Boolean,
     val reason: String = "",

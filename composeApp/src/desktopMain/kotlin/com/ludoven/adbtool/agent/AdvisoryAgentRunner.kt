@@ -64,6 +64,13 @@ class AdvisoryAgentRunner(
         state = state.copy(
             isRunning = false,
             phase = AgentRunPhase.COMPLETED,
+            outcome = AgentTaskOutcome.VERIFIED_SUCCESS,
+            verification = AgentVerificationState(
+                verdict = AgentVerificationVerdict.VERIFIED,
+                level = if (authorizedEvidence) AgentVerificationLevel.VISUAL else AgentVerificationLevel.ENGINE_REPORTED,
+                source = if (authorizedEvidence) AgentEvidenceSource.VISUAL_REVIEW else AgentEvidenceSource.NONE,
+                summary = "Advisory answer completed"
+            ),
             usage = result.decision.usage,
             lastRequestUsage = result.decision.usage,
             messages = state.messages + AgentMessage(

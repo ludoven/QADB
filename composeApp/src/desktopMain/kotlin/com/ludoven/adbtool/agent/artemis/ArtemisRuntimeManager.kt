@@ -5,6 +5,18 @@ import java.net.URI
 import java.security.SecureRandom
 import java.nio.file.Files
 
+enum class ArtemisRuntimeState {
+    STOPPED,
+    STARTING,
+    READY,
+    UNHEALTHY,
+    STOPPING,
+    CRASHED;
+
+    val isRunning: Boolean
+        get() = this == STARTING || this == READY || this == UNHEALTHY
+}
+
 /** Configuration contains paths and ports only; model keys must never become command arguments. */
 data class ManagedArtemisRuntimeSpec(
     val pythonExecutable: Path,
@@ -12,7 +24,8 @@ data class ManagedArtemisRuntimeSpec(
     val port: Int,
     val bridgeModuleDirectory: Path,
     val bridgeLedgerPath: Path,
-    val bridgeToken: String
+    val bridgeToken: String,
+    val extraEnvironment: Map<String, String> = emptyMap()
 ) {
     init {
         require(port in 1024..65535) { "Managed Artemis port must be a user port" }
@@ -32,7 +45,7 @@ data class ManagedArtemisRuntimeSpec(
         "QADB_BRIDGE_TOKEN" to bridgeToken,
         "QADB_BRIDGE_LEDGER" to bridgeLedgerPath.toString(),
         "QADB_TASK_VERSION" to "0"
-    )
+    ) + extraEnvironment
 }
 
 interface ArtemisOwnedProcess {
@@ -69,15 +82,38 @@ class ManagedArtemisRuntime(
     private val temporaryDirectory: Path = Path.of(System.getProperty("java.io.tmpdir"))
 ) {
     private var connection: ManagedArtemisConnection? = null
+    private var _state: ArtemisRuntimeState = ArtemisRuntimeState.STOPPED
+    val state: ArtemisRuntimeState get() = _state
 
     init {
         Runtime.getRuntime().addShutdownHook(
-            Thread({ manager.stopOwnedRuntime() }, "qadb-artemis-shutdown")
+            Thread({ stop() }, "qadb-artemis-shutdown")
         )
     }
 
-    @Synchronized fun requireConnection(baseUrl: String): ManagedArtemisConnection {
-        connection?.let { return it }
+    @Synchronized fun checkHealth(): ArtemisRuntimeState {
+        if (connection != null && !manager.isAlive()) {
+            connection = null
+            _state = ArtemisRuntimeState.CRASHED
+        }
+        return _state
+    }
+
+    @Synchronized fun requireConnection(
+        baseUrl: String,
+        extraEnvironment: Map<String, String> = emptyMap()
+    ): ManagedArtemisConnection {
+        checkHealth()
+        connection?.let {
+            if (_state == ArtemisRuntimeState.READY && manager.isAlive()) {
+                return it
+            }
+            connection = null
+        }
+        check(_state != ArtemisRuntimeState.CRASHED) {
+            "Managed Artemis runtime crashed; manual restart or reconciliation required"
+        }
+
         val uri = URI(baseUrl)
         require(uri.host in setOf("127.0.0.1", "localhost")) { "Managed Artemis must use loopback" }
         val paths = resolveManagedArtemisPaths(environment, userDirectory, temporaryDirectory)
@@ -89,10 +125,36 @@ class ManagedArtemisRuntime(
             paths.runtimeDirectory,
             port,
             paths.bridgeDirectory,
-            ledgerDir.resolve("bridge.sqlite")
+            ledgerDir.resolve("bridge.sqlite"),
+            extraEnvironment = extraEnvironment
         )
-        manager.start(spec)
-        return ManagedArtemisConnection("http://127.0.0.1:$port", spec.bridgeToken).also { connection = it }
+        _state = ArtemisRuntimeState.STARTING
+        try {
+            manager.start(spec)
+            _state = ArtemisRuntimeState.READY
+            val conn = ManagedArtemisConnection("http://127.0.0.1:$port", spec.bridgeToken)
+            connection = conn
+            return conn
+        } catch (t: Throwable) {
+            _state = ArtemisRuntimeState.CRASHED
+            connection = null
+            throw t
+        }
+    }
+
+    @Synchronized fun stop(): Boolean {
+        _state = ArtemisRuntimeState.STOPPING
+        val stopped = manager.stopOwnedRuntime()
+        connection = null
+        _state = ArtemisRuntimeState.STOPPED
+        return stopped
+    }
+
+    @Synchronized fun resetCrashed() {
+        if (_state == ArtemisRuntimeState.CRASHED) {
+            _state = ArtemisRuntimeState.STOPPED
+            connection = null
+        }
     }
 }
 
@@ -164,6 +226,8 @@ class ArtemisRuntimeManager(private val launcher: ArtemisRuntimeLauncher) {
         return launcher.start(spec.command(), spec.workingDirectory, spec.environment()).also { ownedProcess = it }
     }
 
+    fun isAlive(): Boolean = ownedProcess?.alive == true
+
     fun stopOwnedRuntime(): Boolean {
         val process = ownedProcess ?: return false
         if (process.alive) process.destroy()
@@ -178,14 +242,16 @@ class ArtemisRuntimeManager(private val launcher: ArtemisRuntimeLauncher) {
             workingDirectory: Path,
             port: Int,
             bridgeModuleDirectory: Path,
-            bridgeLedgerPath: Path
+            bridgeLedgerPath: Path,
+            extraEnvironment: Map<String, String> = emptyMap()
         ): ManagedArtemisRuntimeSpec = ManagedArtemisRuntimeSpec(
             pythonExecutable = pythonExecutable,
             workingDirectory = workingDirectory,
             port = port,
             bridgeModuleDirectory = bridgeModuleDirectory,
             bridgeLedgerPath = bridgeLedgerPath,
-            bridgeToken = ByteArray(32).also(SecureRandom()::nextBytes).joinToString("") { "%02x".format(it) }
+            bridgeToken = ByteArray(32).also(SecureRandom()::nextBytes).joinToString("") { "%02x".format(it) },
+            extraEnvironment = extraEnvironment
         )
     }
 }

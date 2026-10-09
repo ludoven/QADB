@@ -8,8 +8,17 @@ import com.ludoven.adbtool.agent.AgentExecutionStrategy
 import com.ludoven.adbtool.agent.AgentStep
 import com.ludoven.adbtool.agent.AgentStepStatus
 import com.ludoven.adbtool.agent.AgentRunPhase
+import com.ludoven.adbtool.agent.AgentTaskOutcome
+import com.ludoven.adbtool.agent.AgentVerificationLevel
+import com.ludoven.adbtool.agent.AgentVerificationVerdict
+import com.ludoven.adbtool.agent.AgentEvidenceSource
+import com.ludoven.adbtool.agent.AgentVerificationState
 import com.ludoven.adbtool.agent.AgentTaskRunner
 import com.ludoven.adbtool.agent.AgentTaskUiState
+import com.ludoven.adbtool.agent.AgentDeviceGateway
+import com.ludoven.adbtool.agent.AgentPublicActivityReducer
+import com.ludoven.adbtool.agent.DeviceState
+import com.ludoven.adbtool.agent.SemanticRiskClassifier
 import com.ludoven.adbtool.agent.CancellableAgentTaskRunner
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -32,7 +41,8 @@ class ArtemisAgentEngine(
     private val profile: ArtemisProfile,
     private val bridge: ArtemisBridge,
     private val registry: ExternalTaskRegistry = ExternalTaskRuntime.registry,
-    private val pollIntervalMs: Long = DEFAULT_POLL_INTERVAL_MS
+    private val pollIntervalMs: Long = DEFAULT_POLL_INTERVAL_MS,
+    private val deviceGateway: AgentDeviceGateway? = null
 ) : CancellableAgentTaskRunner {
     private val externalSessions = ConcurrentHashMap<String, String>()
 
@@ -61,10 +71,14 @@ class ArtemisAgentEngine(
         var streamJob: Job? = null
         var heartbeatJob: Job? = null
         persist("submitting")
+        val traceAdapter = ArtemisTraceAdapter(qadbRunId)
+        var lastUsageFetchMs = System.currentTimeMillis()
+
         var state = initialState.copy(
             isRunning = true,
             needsUser = false,
             boundDeviceId = deviceId,
+            conversationId = initialState.conversationId,
             phase = AgentRunPhase.THINKING,
             executionStrategy = AgentExecutionStrategy.SEMANTIC_V2,
             errorMessage = null,
@@ -73,13 +87,37 @@ class ArtemisAgentEngine(
                 "Artemis ${profile.wireValue} submitted with session $sessionId").takeLast(40)
         )
 
+        val gateway = deviceGateway
+        if (state.latestScreenshot == null && gateway != null) {
+            runCatching {
+                val obs = gateway.observe(deviceId)
+                state = state.copy(
+                    latestScreenshot = obs.screenshotPng,
+                    deviceState = com.ludoven.adbtool.agent.PageSignatureEngine.state(obs)
+                )
+            }
+        }
+
         fun publish() = onState(state)
-        fun terminal(phase: AgentRunPhase, message: String): AgentTaskUiState {
+        fun terminal(
+            phase: AgentRunPhase,
+            message: String,
+            outcome: AgentTaskOutcome? = null,
+            verification: AgentVerificationState = state.verification
+        ): AgentTaskUiState {
+            val resolvedOutcome = outcome ?: when (phase) {
+                AgentRunPhase.COMPLETED -> AgentTaskOutcome.ENGINE_FINISHED
+                AgentRunPhase.FAILED -> AgentTaskOutcome.FAILED
+                AgentRunPhase.CANCELLED -> AgentTaskOutcome.CANCELLED
+                else -> AgentTaskOutcome.OUTCOME_UNKNOWN
+            }
             state = state.copy(
                 isRunning = false,
                 needsUser = false,
                 pendingConfirmation = null,
                 phase = phase,
+                outcome = resolvedOutcome,
+                verification = verification,
                 messages = state.messages + AgentMessage(
                     id = UUID.randomUUID().toString(),
                     role = AgentMessageRole.ASSISTANT,
@@ -103,12 +141,14 @@ class ArtemisAgentEngine(
             heartbeatJob = CoroutineScope(coroutineContext).launch {
                 while (isActive) { bridge.heartbeat(qadbRunId); delay(3_000) }
             }
+            val convId = initialState.conversationId?.takeIf { runCatching { UUID.fromString(it) }.isSuccess }
             when (val submitted = client.submit(
                 ArtemisRunRequest(
                     goal = task,
                     profile = profile,
                     deviceSerial = deviceId,
-                    sessionId = sessionId
+                    sessionId = sessionId,
+                    conversationId = convId
                 )
             )) {
                 is ArtemisSubmitResult.Rejected -> return terminal(
@@ -151,6 +191,21 @@ class ArtemisAgentEngine(
                         publish()
                         return@forEach
                     }
+                    val semanticAssessment = SemanticRiskClassifier.evaluate(
+                        actionKind = metadata.actionKind,
+                        target = metadata.actionTarget,
+                        intentStr = metadata.intent
+                    )
+                    if (semanticAssessment.level == AgentRiskLevel.BLOCKED) {
+                        bridge.decide(qadbRunId, approvalId, false)
+                        decidedApprovals += approvalId
+                        state = state.copy(
+                            executionDetails = (state.executionDetails +
+                                "Blocked high-risk action: ${semanticAssessment.reason}").takeLast(40)
+                        )
+                        publish()
+                        return@forEach
+                    }
                     var approvalStep = AgentStep(
                         id = "artemis-$approvalId", action = AgentAction.ExternalApproval(
                             approvalId = metadata.approvalId,
@@ -163,7 +218,11 @@ class ArtemisAgentEngine(
                         ),
                         status = AgentStepStatus.AWAITING_CONFIRMATION,
                         riskLevel = AgentRiskLevel.CONFIRMATION_REQUIRED,
-                        confirmationReason = "Artemis 请求执行设备操作；批准仅对该设备、目标和动作摘要有效一次。"
+                        confirmationReason = if (semanticAssessment.reason.isNotBlank()) {
+                            semanticAssessment.reason
+                        } else {
+                            "Artemis 请求执行设备操作；批准仅对该设备、目标和动作摘要有效一次。"
+                        }
                     )
                     state = state.copy(
                         steps = state.steps + approvalStep,
@@ -188,14 +247,35 @@ class ArtemisAgentEngine(
                 }
                 while (true) {
                     val event = pendingEvents.poll() ?: break
-                    ArtemisEventMapper.map(event, sessionId)?.let { mapped ->
-                        mapped.status?.takeIf(ArtemisTaskStatus::isProgressStatus)
-                            ?.let { persist(it.name.lowercase()) }
-                        state = state.copy(
-                            phase = mapped.status.toStreamingPhaseOr(state.phase),
-                            executionDetails = (state.executionDetails +
-                                (mapped.detail ?: "Artemis event received")).takeLast(40)
-                        )
+                    val mapped = ArtemisEventMapper.map(event, sessionId)
+                    mapped?.status?.takeIf(ArtemisTaskStatus::isProgressStatus)
+                        ?.let { persist(it.name.lowercase()) }
+
+                    val adapted = traceAdapter.adapt(event)
+                    var nextPublicActivity = state.publicActivity
+                    adapted.publicEvents.forEach { publicEvt ->
+                        nextPublicActivity = AgentPublicActivityReducer.reduce(nextPublicActivity, publicEvt)
+                    }
+                    if (adapted.step != null) {
+                        state = state.replaceArtemisStep(adapted.step)
+                    }
+                    val nextScreenshot = adapted.screenshotPng ?: state.latestScreenshot
+                    val nextPhase = mapped?.status?.toStreamingPhaseOr(state.phase) ?: state.phase
+
+                    state = state.copy(
+                        phase = nextPhase,
+                        publicActivity = nextPublicActivity,
+                        latestScreenshot = nextScreenshot,
+                        executionDetails = (state.executionDetails +
+                            (adapted.summaryDetail ?: mapped?.detail ?: "Artemis event received")).takeLast(40)
+                    )
+                    publish()
+                }
+
+                if (System.currentTimeMillis() - lastUsageFetchMs >= 2500L) {
+                    lastUsageFetchMs = System.currentTimeMillis()
+                    runCatching { client.getUsage(sessionId) }.getOrNull()?.let { usageSnapshot ->
+                        state = ArtemisUsageAdapter.updateStateWithUsage(state, usageSnapshot, qadbRunId)
                         publish()
                     }
                 }
@@ -231,26 +311,75 @@ class ArtemisAgentEngine(
                         }
                         ArtemisTaskStatus.COMPLETED -> {
                             persist("completed")
+                            runCatching { client.getUsage(sessionId) }.getOrNull()?.let { usageSnapshot ->
+                                state = ArtemisUsageAdapter.updateStateWithUsage(state, usageSnapshot, qadbRunId)
+                            }
+                            val isCheckerVerified = state.verification.verdict == AgentVerificationVerdict.VERIFIED ||
+                                (lookup.summary?.contains("Checker: verified", ignoreCase = true) == true)
+                            val finalOutcome = if (isCheckerVerified) {
+                                AgentTaskOutcome.VERIFIED_SUCCESS
+                            } else {
+                                AgentTaskOutcome.ENGINE_FINISHED
+                            }
+                            val finalVerification = if (isCheckerVerified) {
+                                state.verification.copy(
+                                    verdict = AgentVerificationVerdict.VERIFIED,
+                                    level = AgentVerificationLevel.VISUAL,
+                                    source = AgentEvidenceSource.ARTEMIS_CHECKER,
+                                    summary = lookup.summary
+                                )
+                            } else {
+                                state.verification.copy(
+                                    verdict = AgentVerificationVerdict.UNVERIFIED,
+                                    level = AgentVerificationLevel.ENGINE_REPORTED,
+                                    source = AgentEvidenceSource.NONE,
+                                    summary = lookup.summary
+                                )
+                            }
                             return terminal(
-                            AgentRunPhase.COMPLETED,
-                            lookup.summary?.takeIf(String::isNotBlank)
-                                ?.let { "$it\n\nArtemis 报告执行结束，设备最终效果尚未独立核实。" }
-                                ?: "Artemis 报告执行结束，设备最终效果尚未独立核实。"
+                                phase = AgentRunPhase.COMPLETED,
+                                message = lookup.summary?.takeIf(String::isNotBlank)
+                                    ?.let { "$it\n\nArtemis 报告执行结束，设备最终效果尚未独立核实。" }
+                                    ?: "Artemis 报告执行结束，设备最终效果尚未独立核实。",
+                                outcome = finalOutcome,
+                                verification = finalVerification
                             )
                         }
                         ArtemisTaskStatus.FAILED,
                         ArtemisTaskStatus.REJECTED -> {
                             persist(lookup.handle.status.name.lowercase())
+                            runCatching { client.getUsage(sessionId) }.getOrNull()?.let { usageSnapshot ->
+                                state = ArtemisUsageAdapter.updateStateWithUsage(state, usageSnapshot, qadbRunId)
+                            }
                             return terminal(
-                            AgentRunPhase.FAILED,
-                            lookup.summary?.takeIf(String::isNotBlank)
-                                ?: "Artemis ${lookup.handle.status.name.lowercase()} the task."
+                                phase = AgentRunPhase.FAILED,
+                                message = lookup.summary?.takeIf(String::isNotBlank)
+                                    ?: "Artemis ${lookup.handle.status.name.lowercase()} the task.",
+                                outcome = AgentTaskOutcome.FAILED,
+                                verification = state.verification.copy(
+                                    verdict = AgentVerificationVerdict.FAILED,
+                                    summary = lookup.summary
+                                )
                             )
                         }
                     }
                 }
                 delay(pollIntervalMs)
             }
+        } catch (failure: Throwable) {
+            if (state.phase != AgentRunPhase.COMPLETED && state.phase != AgentRunPhase.CANCELLED) {
+                persist("crashed_unknown")
+                return terminal(
+                    phase = AgentRunPhase.FAILED,
+                    message = "Artemis runtime connection lost or crashed: ${failure.message ?: "Unknown error"}",
+                    outcome = AgentTaskOutcome.OUTCOME_UNKNOWN,
+                    verification = state.verification.copy(
+                        verdict = AgentVerificationVerdict.UNKNOWN,
+                        summary = failure.message
+                    )
+                )
+            }
+            throw failure
         } finally {
             streamJob?.cancel()
             heartbeatJob?.cancel()

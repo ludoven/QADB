@@ -177,6 +177,7 @@ class ScreenshotAgentEngine(
             isRunning = true,
             needsUser = false,
             boundDeviceId = deviceId,
+            conversationId = initialState.conversationId,
             pendingConfirmation = null,
             errorMessage = null,
             failure = null,
@@ -219,6 +220,7 @@ class ScreenshotAgentEngine(
                 needsUser = false,
                 pendingConfirmation = null,
                 phase = AgentRunPhase.FAILED,
+                outcome = AgentTaskOutcome.FAILED,
                 errorMessage = message,
                 failure = agentFailureFrom(message)
             )
@@ -231,6 +233,7 @@ class ScreenshotAgentEngine(
                 needsUser = true,
                 pendingConfirmation = null,
                 phase = AgentRunPhase.COMPLETED,
+                outcome = AgentTaskOutcome.NEEDS_USER,
                 errorMessage = null,
                 failure = null,
                 messages = state.messages + AgentMessage(
@@ -244,12 +247,22 @@ class ScreenshotAgentEngine(
             publish()
             return state
         }
-        fun complete(message: String): AgentTaskUiState {
+        fun complete(
+            message: String,
+            outcome: AgentTaskOutcome = AgentTaskOutcome.ENGINE_FINISHED,
+            verification: AgentVerificationState = AgentVerificationState(
+                verdict = AgentVerificationVerdict.UNVERIFIED,
+                level = AgentVerificationLevel.ENGINE_REPORTED,
+                summary = message
+            )
+        ): AgentTaskUiState {
             state = state.copy(
                 isRunning = false,
                 needsUser = false,
                 pendingConfirmation = null,
                 phase = AgentRunPhase.COMPLETED,
+                outcome = outcome,
+                verification = verification,
                 messages = state.messages + AgentMessage(
                     id = UUID.randomUUID().toString(),
                     role = AgentMessageRole.ASSISTANT,
@@ -312,7 +325,16 @@ class ScreenshotAgentEngine(
                     state = state.copy(lastRequestUsage = progress.usage)
                     updateBudget()
                     when (progress.assessment.verdict) {
-                        ProgressVerdict.FINISH -> return complete(progress.assessment.evidence)
+                        ProgressVerdict.FINISH -> return complete(
+                            message = progress.assessment.evidence,
+                            outcome = AgentTaskOutcome.VERIFIED_SUCCESS,
+                            verification = AgentVerificationState(
+                                verdict = AgentVerificationVerdict.VERIFIED,
+                                level = AgentVerificationLevel.VISUAL,
+                                source = AgentEvidenceSource.VISUAL_REVIEW,
+                                summary = progress.assessment.evidence
+                            )
+                        )
                         ProgressVerdict.BLOCKED -> return needsUser(progress.assessment.evidence)
                         ProgressVerdict.CONTINUE -> {
                             val milestone = progress.assessment.nextMilestone.orEmpty()
@@ -340,7 +362,16 @@ class ScreenshotAgentEngine(
                     return fail("The model returned an action for a stale screenshot revision")
                 }
                 when (decision) {
-                    is ScreenshotAgentDecision.Finish -> return complete(decision.summary)
+                    is ScreenshotAgentDecision.Finish -> return complete(
+                        message = decision.summary,
+                        outcome = AgentTaskOutcome.ENGINE_FINISHED,
+                        verification = AgentVerificationState(
+                            verdict = AgentVerificationVerdict.UNVERIFIED,
+                            level = AgentVerificationLevel.ENGINE_REPORTED,
+                            source = AgentEvidenceSource.NONE,
+                            summary = decision.summary
+                        )
+                    )
                     is ScreenshotAgentDecision.AskUser -> return needsUser(decision.question)
                     is ScreenshotAgentDecision.Blocked -> return fail("Task blocked: ${decision.reason}")
                     is ScreenshotAgentDecision.Execute -> Unit
